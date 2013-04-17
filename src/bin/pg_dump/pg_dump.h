@@ -290,6 +290,7 @@ typedef struct _tableInfo
 	int			numParents;		/* number of (immediate) parent tables */
 	struct _tableInfo **parents;	/* TableInfos of immediate parents */
 	struct _tableDataInfo *dataObj;		/* TableDataInfo, if dumping its data */
+	char     *ordercond;    /* ORDER condition to order dumped rows, should prob. be in dataObj, but we find it out from the indexes before that's created (though arguably should do it's own query since that's the only way to support --data-only with --cluster-order) */
 } TableInfo;
 
 typedef struct _attrDefInfo

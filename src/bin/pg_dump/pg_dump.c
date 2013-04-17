@@ -131,6 +131,7 @@ static const CatalogId nilCatalogId = {0, 0};
 static int	binary_upgrade = 0;
 static int	disable_dollar_quoting = 0;
 static int	dump_inserts = 0;
+static int	cluster_order = 0;
 static int	column_inserts = 0;
 static int	if_exists = 0;
 static int	no_security_labels = 0;
@@ -342,6 +343,7 @@ main(int argc, char **argv)
 		 */
 		{"attribute-inserts", no_argument, &column_inserts, 1},
 		{"binary-upgrade", no_argument, &binary_upgrade, 1},
+		{"cluster-order", no_argument, &cluster_order, 1},
 		{"column-inserts", no_argument, &column_inserts, 1},
 		{"disable-dollar-quoting", no_argument, &disable_dollar_quoting, 1},
 		{"disable-triggers", no_argument, &disable_triggers, 1},
@@ -894,6 +896,7 @@ help(const char *progname)
 	printf(_("  -T, --exclude-table=TABLE    do NOT dump the named table(s)\n"));
 	printf(_("  -x, --no-privileges          do not dump privileges (grant/revoke)\n"));
 	printf(_("  --binary-upgrade             for use by upgrade utilities only\n"));
+	printf(_("  --cluster-order              dump table data in clustered index order (>= 8.2)\n"));
 	printf(_("  --column-inserts             dump data as INSERT commands with column names\n"));
 	printf(_("  --disable-dollar-quoting     disable dollar quoting, use SQL standard quoting\n"));
 	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
@@ -1429,7 +1432,7 @@ dumpTableData_copy(Archive *fout, void *dcontext)
 										 classname),
 						  column_list);
 	}
-	else if (tdinfo->filtercond)
+	else if (tdinfo->filtercond || tbinfo->ordercond)
 	{
 		/* Note: this syntax is only supported in 8.2 and up */
 		appendPQExpBufferStr(q, "COPY (SELECT ");
@@ -1441,11 +1444,15 @@ dumpTableData_copy(Archive *fout, void *dcontext)
 		}
 		else
 			appendPQExpBufferStr(q, "* ");
-		appendPQExpBuffer(q, "FROM %s %s) TO stdout;",
+		appendPQExpBuffer(q, "FROM %s ",
 						  fmtQualifiedId(fout->remoteVersion,
 										 tbinfo->dobj.namespace->dobj.name,
-										 classname),
-						  tdinfo->filtercond);
+										 classname));
+		if (tdinfo->filtercond)
+		  appendPQExpBuffer(q, "%s ", tdinfo->filtercond);
+		if (tbinfo->ordercond)
+		  appendPQExpBuffer(q, "%s", tbinfo->ordercond);
+		appendPQExpBuffer(q, ") TO stdout;");
 	}
 	else
 	{
@@ -1591,6 +1598,8 @@ dumpTableData_insert(Archive *fout, void *dcontext)
 	}
 	if (tdinfo->filtercond)
 		appendPQExpBuffer(q, " %s", tdinfo->filtercond);
+	if (tbinfo->ordercond)
+		appendPQExpBuffer(q, " %s", tbinfo->ordercond);
 
 	ExecuteSqlStatement(fout, q->data);
 
@@ -4987,6 +4996,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 				i_oid,
 				i_indexname,
 				i_indexdef,
+				i_indexdeforderclause,
 				i_indnkeys,
 				i_indkey,
 				i_indisclustered,
@@ -5047,6 +5057,14 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							  "SELECT t.tableoid, t.oid, "
 							  "t.relname AS indexname, "
 					 "pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef, "
+					 /*
+					  * FIXME - regex is not the best way to to do this, but
+					  * indexdef is consistent enough that it should work
+					  * Any missing corner cases worth worrying about?
+					  * A column named "foo ) WITH" would be problematic...
+					  * but would need a parser to cover all possible cases
+					  */
+					 "CASE WHEN i.indisclustered THEN 'ORDER BY ' || regexp_replace(pg_catalog.pg_get_indexdef(i.indexrelid), E'^CREATE (UNIQUE )?INDEX (CONCURRENTLY )?.* ON .* USING [^\\\\(]*\\\\((.*?)\\\\)($| WITH .*| WHERE .*| TABLESPACE .*)', E'\\\\3') ELSE NULL END AS indexdeforderclause, "
 							  "t.relnatts AS indnkeys, "
 							  "i.indkey, i.indisclustered, "
 							  "i.indisreplident, t.relpages, "
@@ -5105,6 +5123,14 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							  "SELECT t.tableoid, t.oid, "
 							  "t.relname AS indexname, "
 					 "pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef, "
+					 /*
+					  * FIXME - regex is not the best way to to do this, but
+					  * indexdef is consistent enough that it should work
+					  * Any missing corner cases worth worrying about?
+					  * A column named "foo ) WITH" would be problematic...
+					  * but would need a parser to cover all possible cases
+					  */
+					 "CASE WHEN i.indisclustered THEN 'ORDER BY ' || regexp_replace(pg_catalog.pg_get_indexdef(i.indexrelid), E'^CREATE (UNIQUE )?INDEX (CONCURRENTLY )?.* ON .* USING [^\\\\(]*\\\\((.*?)\\\\)($| WITH .*| WHERE .*| TABLESPACE .*)', E'\\\\3') ELSE NULL END AS indexdeforderclause, "
 							  "t.relnatts AS indnkeys, "
 							  "i.indkey, i.indisclustered, "
 							  "false AS indisreplident, t.relpages, "
@@ -5135,6 +5161,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							  "SELECT t.tableoid, t.oid, "
 							  "t.relname AS indexname, "
 					 "pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef, "
+					 "NULL AS indexdeforderclause, "
 							  "t.relnatts AS indnkeys, "
 							  "i.indkey, i.indisclustered, "
 							  "false AS indisreplident, t.relpages, "
@@ -5164,6 +5191,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							  "SELECT t.tableoid, t.oid, "
 							  "t.relname AS indexname, "
 					 "pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef, "
+					 "NULL AS indexdeforderclause, "
 							  "t.relnatts AS indnkeys, "
 							  "i.indkey, i.indisclustered, "
 							  "false AS indisreplident, t.relpages, "
@@ -5193,6 +5221,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							  "SELECT t.tableoid, t.oid, "
 							  "t.relname AS indexname, "
 							  "pg_get_indexdef(i.indexrelid) AS indexdef, "
+							  "NULL AS indexdeforderclause, "
 							  "t.relnatts AS indnkeys, "
 							  "i.indkey, false AS indisclustered, "
 							  "false AS indisreplident, t.relpages, "
@@ -5220,6 +5249,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							  "t.oid, "
 							  "t.relname AS indexname, "
 							  "pg_get_indexdef(i.indexrelid) AS indexdef, "
+							  "NULL AS indexdeforderclause, "
 							  "t.relnatts AS indnkeys, "
 							  "i.indkey, false AS indisclustered, "
 							  "false AS indisreplident, t.relpages, "
@@ -5248,6 +5278,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 		i_oid = PQfnumber(res, "oid");
 		i_indexname = PQfnumber(res, "indexname");
 		i_indexdef = PQfnumber(res, "indexdef");
+		i_indexdeforderclause = PQfnumber(res, "indexdeforderclause");
 		i_indnkeys = PQfnumber(res, "indnkeys");
 		i_indkey = PQfnumber(res, "indkey");
 		i_indisclustered = PQfnumber(res, "indisclustered");
@@ -5339,6 +5370,15 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 				/* Plain secondary index */
 				indxinfo[j].indexconstraint = 0;
 			}
+
+			/*
+			 * propogate table order clause if clustered index for this
+			 * table and --cluster-order is specified
+			 */
+			if (cluster_order && fout->remoteVersion >= 80200 &&
+				indxinfo[j].indisclustered && !tbinfo->ordercond &&
+				PQgetvalue(res, j, i_indexdeforderclause))
+				tbinfo->ordercond = strdup(PQgetvalue(res, j, i_indexdeforderclause));
 		}
 
 		PQclear(res);
