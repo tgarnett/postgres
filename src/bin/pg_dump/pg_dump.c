@@ -136,6 +136,7 @@ static int	dump_inserts = 0;
 static int	cluster_order = 0;
 static int	cluster_order_no_seq_scan = 0;
 static int	column_inserts = 0;
+static int	interleaved = 0;
 static int	no_security_labels = 0;
 static int	no_unlogged_table_data = 0;
 static int	serializable_deferrable = 0;
@@ -345,6 +346,7 @@ main(int argc, char **argv)
 		{"disable-triggers", no_argument, &disable_triggers, 1},
 		{"exclude-table-data", required_argument, NULL, 4},
 		{"inserts", no_argument, &dump_inserts, 1},
+		{"interleaved", no_argument, &interleaved, 1},
 		{"lock-wait-timeout", required_argument, NULL, 2},
 		{"no-tablespaces", no_argument, &outputNoTablespaces, 1},
 		{"quote-all-identifiers", no_argument, &quote_all_identifiers, 1},
@@ -744,7 +746,12 @@ main(int argc, char **argv)
 	 * use OID ordering as an (unreliable) guide to creation order.
 	 */
 	if (fout->remoteVersion >= 70300)
-		sortDumpableObjectsByTypeName(dobjs, numObjs);
+	{
+		if (interleaved)
+			sortDumpableObjectsByTableTypeName(dobjs, numObjs);
+		else
+			sortDumpableObjectsByTypeName(dobjs, numObjs);
+	}
 	else
 		sortDumpableObjectsByTypeOid(dobjs, numObjs);
 
@@ -860,6 +867,7 @@ help(const char *progname)
 	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
 	printf(_("  --exclude-table-data=TABLE   do NOT dump data for the named table(s)\n"));
 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
+	printf(_("  --interleaved                dump table indexes immediately after table\n"));
 	printf(_("  --no-security-labels         do not dump security label assignments\n"));
 	printf(_("  --no-tablespaces             do not dump tablespace assignments\n"));
 	printf(_("  --no-unlogged-table-data     do not dump unlogged table data\n"));
@@ -4827,6 +4835,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 				indxinfo[j].indisclustered && !tbinfo->ordercond &&
 				PQgetvalue(res, j, i_indexdeforderclause))
 				tbinfo->ordercond = strdup(PQgetvalue(res, j, i_indexdeforderclause));
+
 		}
 
 		PQclear(res);
@@ -13035,6 +13044,9 @@ dumpIndex(Archive *fout, IndxInfo *indxinfo)
 					 tbinfo->dobj.namespace->dobj.name,
 					 indxinfo->tablespace,
 					 tbinfo->rolname, false,
+					 /* Note - using the 'wrong' section here limits flexibility in pg_restore
+					  * but removes dump order warnings
+					  *  interleaved ? SECTION_DATA : SECTION_POST_DATA*/
 					 "INDEX", SECTION_POST_DATA,
 					 q->data, delq->data, NULL,
 					 NULL, 0,
@@ -13156,6 +13168,9 @@ dumpConstraint(Archive *fout, ConstraintInfo *coninfo)
 					 tbinfo->dobj.namespace->dobj.name,
 					 indxinfo->tablespace,
 					 tbinfo->rolname, false,
+					 /* Note - using the 'wrong' section here limits flexibility in pg_restore
+					  * but removes dump order warnings
+					  *  interleaved ? SECTION_DATA : SECTION_POST_DATA*/
 					 "CONSTRAINT", SECTION_POST_DATA,
 					 q->data, delq->data, NULL,
 					 NULL, 0,
@@ -14315,6 +14330,12 @@ addBoundaryDependencies(DumpableObject **dobjs, int numObjs,
 				addObjectDependency(postDataBound, dobj->dumpId);
 				break;
 			case DO_INDEX:
+				/* If interleaved dumped with table data, else fall through */
+				if (interleaved)
+				{
+					addObjectDependency(dobj, preDataBound->dumpId);
+					break;
+				}
 			case DO_TRIGGER:
 			case DO_DEFAULT_ACL:
 				/* Post-data objects: must come after the post-data boundary */
@@ -14326,6 +14347,12 @@ addBoundaryDependencies(DumpableObject **dobjs, int numObjs,
 					addObjectDependency(dobj, postDataBound->dumpId);
 				break;
 			case DO_CONSTRAINT:
+				/* If interleaved dumped with table data, else fall through */
+				if (interleaved && ((ConstraintInfo *) dobj)->separate)
+				{
+					addObjectDependency(dobj, preDataBound->dumpId);
+					break;
+				}
 			case DO_FK_CONSTRAINT:
 				/* Constraints are post-data, but only if dumped separately */
 				if (((ConstraintInfo *) dobj)->separate)

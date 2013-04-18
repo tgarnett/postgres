@@ -116,11 +116,61 @@ static const int newObjectTypePriority[] =
 	25							/* DO_POST_DATA_BOUNDARY */
 };
 
+/*
+ * Sort priority for object types when dumping newer databases interleaved.
+ * Objects are sorted by type, and within a type by name. For inteleaved
+ * table data, non-fk constraints, and indexes have same priority.
+ *
+ * NOTE: object-type priorities must match the section assignments made in
+ * pg_dump.c; that is, PRE_DATA objects must sort before DO_PRE_DATA_BOUNDARY,
+ * POST_DATA objects must sort after DO_POST_DATA_BOUNDARY, and DATA objects
+ * must sort between them.
+ */
+static const int newInterleavedObjectTypePriority[] =
+{
+	1,							/* DO_NAMESPACE */
+	4,							/* DO_EXTENSION */
+	5,							/* DO_TYPE */
+	5,							/* DO_SHELL_TYPE */
+	6,							/* DO_FUNC */
+	7,							/* DO_AGG */
+	8,							/* DO_OPERATOR */
+	9,							/* DO_OPCLASS */
+	9,							/* DO_OPFAMILY */
+	3,							/* DO_COLLATION */
+	11,							/* DO_CONVERSION */
+	18,							/* DO_TABLE */
+	20,							/* DO_ATTRDEF */
+	23,							/* DO_INDEX */
+	28,							/* DO_RULE */
+	29,							/* DO_TRIGGER */
+	23,							/* DO_CONSTRAINT */
+	30,							/* DO_FK_CONSTRAINT */
+	2,							/* DO_PROCLANG */
+	10,							/* DO_CAST */
+	23,							/* DO_TABLE_DATA */
+	19,							/* DO_DUMMY_TYPE */
+	12,							/* DO_TSPARSER */
+	14,							/* DO_TSDICT */
+	13,							/* DO_TSTEMPLATE */
+	15,							/* DO_TSCONFIG */
+	16,							/* DO_FDW */
+	17,							/* DO_FOREIGN_SERVER */
+	31,							/* DO_DEFAULT_ACL */
+	21,							/* DO_BLOB */
+	24,							/* DO_BLOB_DATA */
+	22,							/* DO_PRE_DATA_BOUNDARY */
+	25							/* DO_POST_DATA_BOUNDARY */
+};
+
+
 static DumpId preDataBoundId;
 static DumpId postDataBoundId;
 
 
 static int	DOTypeNameCompare(const void *p1, const void *p2);
+static int	DOTableTypeNameCompare(const void *p1, const void *p2);
+static int	DOTypeNameCompareHelper(const void *p1, const void *p2, bool prefix_table_name);
 static int	DOTypeOidCompare(const void *p1, const void *p2);
 static bool TopoSort(DumpableObject **objs,
 		 int numObjs,
@@ -138,12 +188,12 @@ static void repairDependencyLoop(DumpableObject **loop,
 					 int nLoop);
 static void describeDumpableObject(DumpableObject *obj,
 					   char *buf, int bufsize);
-
+static TableInfo *getAssociatedTableInfo(DumpableObject *obj);
 
 /*
  * Sort the given objects into a type/name-based ordering
  *
- * Normally this is just the starting point for the dependency-based
+ * Normally this is just a starting point for the dependency-based
  * ordering.
  */
 void
@@ -157,14 +207,43 @@ sortDumpableObjectsByTypeName(DumpableObject **objs, int numObjs)
 static int
 DOTypeNameCompare(const void *p1, const void *p2)
 {
+	return DOTypeNameCompareHelper(p1, p2, false);
+}
+
+/*
+ * Sort the given objects into a type/table/name-based ordering
+ *
+ * Normally this is just a starting point for the dependency-based
+ * ordering.
+ */
+void
+sortDumpableObjectsByTableTypeName(DumpableObject **objs, int numObjs)
+{
+	if (numObjs > 1)
+		qsort((void *) objs, numObjs, sizeof(DumpableObject *),
+			  DOTableTypeNameCompare);
+}
+
+static int
+DOTableTypeNameCompare(const void *p1, const void *p2)
+{
+	return DOTypeNameCompareHelper(p1, p2, true);
+}
+
+static int
+DOTypeNameCompareHelper(const void *p1, const void *p2, bool prefix_table_name)
+{
 	DumpableObject *obj1 = *(DumpableObject *const *) p1;
 	DumpableObject *obj2 = *(DumpableObject *const *) p2;
 	int			cmpval;
 
-	/* Sort by type */
-	cmpval = newObjectTypePriority[obj1->objType] -
-		newObjectTypePriority[obj2->objType];
-
+	/* Sort by type, if interleaved certain types tie */
+	if (prefix_table_name)
+		cmpval = newInterleavedObjectTypePriority[obj1->objType] -
+			newInterleavedObjectTypePriority[obj2->objType];
+	else
+		cmpval = newObjectTypePriority[obj1->objType] -
+			newObjectTypePriority[obj2->objType];
 	if (cmpval != 0)
 		return cmpval;
 
@@ -177,6 +256,29 @@ DOTypeNameCompare(const void *p1, const void *p2)
 	{
 		cmpval = strcmp(obj1->namespace->dobj.name,
 						obj2->namespace->dobj.name);
+		if (cmpval != 0)
+			return cmpval;
+	}
+
+	/* Sort by table name for indexes, constraints, and fk's, then by type */
+	if (prefix_table_name)
+	{
+		TableInfo *tbl1 = getAssociatedTableInfo(obj1);
+		TableInfo *tbl2 = getAssociatedTableInfo(obj2);
+		if (tbl1 && tbl2)
+		{
+			cmpval = strcmp(tbl1->dobj.name, tbl2->dobj.name);
+			if (cmpval != 0)
+				return cmpval;
+		}
+		/* special case for domain constraints (no table), needed for transitivity */
+		if (tbl1 && !tbl2 && obj2->objType == DO_CONSTRAINT)
+			return -1;
+		if (tbl2 && !tbl1 && obj1->objType == DO_CONSTRAINT)
+			return 1;
+		/* sort by type */
+		cmpval = newObjectTypePriority[obj1->objType] -
+			newObjectTypePriority[obj2->objType];
 		if (cmpval != 0)
 			return cmpval;
 	}
@@ -1063,6 +1165,55 @@ repairDependencyLoop(DumpableObject **loop,
 		removeObjectDependency(loop[0], loop[1]->dumpId);
 	else	/* must be a self-dependency */
 		removeObjectDependency(loop[0], loop[0]->dumpId);
+}
+
+/* Gets the table associated with an index or constraint */
+static TableInfo *
+getAssociatedTableInfo(DumpableObject *obj)
+{
+	switch (obj->objType)
+	{
+		case DO_INDEX:
+			return ((IndxInfo *)obj)->indextable;
+		case DO_CONSTRAINT:
+			return ((ConstraintInfo *)obj)->contable;
+		case DO_FK_CONSTRAINT:
+			/* unclear if best to sort by contable or reftable, contable easier */
+			return ((ConstraintInfo *)obj)->contable;
+		case DO_TABLE_DATA:
+			return ((TableDataInfo *)obj)->tdtable;
+		case DO_NAMESPACE:
+		case DO_EXTENSION:
+		case DO_TYPE:
+		case DO_SHELL_TYPE:
+		case DO_FUNC:
+		case DO_AGG:
+		case DO_OPERATOR:
+		case DO_OPCLASS:
+		case DO_OPFAMILY:
+		case DO_COLLATION:
+		case DO_CONVERSION:
+		case DO_TABLE:
+		case DO_ATTRDEF:
+		case DO_RULE:
+		case DO_TRIGGER:
+		case DO_PROCLANG:
+		case DO_CAST:
+		case DO_DUMMY_TYPE:
+		case DO_TSPARSER:
+		case DO_TSDICT:
+		case DO_TSTEMPLATE:
+		case DO_TSCONFIG:
+		case DO_FDW:
+		case DO_FOREIGN_SERVER:
+		case DO_DEFAULT_ACL:
+		case DO_BLOB:
+		case DO_BLOB_DATA:
+		case DO_PRE_DATA_BOUNDARY:
+		case DO_POST_DATA_BOUNDARY:
+			return NULL;
+	}
+	return NULL;
 }
 
 /*
