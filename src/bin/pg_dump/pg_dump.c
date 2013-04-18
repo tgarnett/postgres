@@ -132,6 +132,7 @@ static int	binary_upgrade = 0;
 static int	disable_dollar_quoting = 0;
 static int	dump_inserts = 0;
 static int	cluster_order = 0;
+static int	cluster_order_no_seq_scan = 0;
 static int	column_inserts = 0;
 static int	if_exists = 0;
 static int	no_security_labels = 0;
@@ -344,6 +345,7 @@ main(int argc, char **argv)
 		{"attribute-inserts", no_argument, &column_inserts, 1},
 		{"binary-upgrade", no_argument, &binary_upgrade, 1},
 		{"cluster-order", no_argument, &cluster_order, 1},
+		{"cluster-order-no-seq-scan", no_argument, &cluster_order_no_seq_scan, 1},
 		{"column-inserts", no_argument, &column_inserts, 1},
 		{"disable-dollar-quoting", no_argument, &disable_dollar_quoting, 1},
 		{"disable-triggers", no_argument, &disable_triggers, 1},
@@ -897,6 +899,8 @@ help(const char *progname)
 	printf(_("  -x, --no-privileges          do not dump privileges (grant/revoke)\n"));
 	printf(_("  --binary-upgrade             for use by upgrade utilities only\n"));
 	printf(_("  --cluster-order              dump table data in clustered index order (>= 8.2)\n"));
+	printf(_("  --cluster-order_no_seq_scan  if --cluster-order disable seq scans for clustered"
+			 "                               table data (>= 8.2)\n"));
 	printf(_("  --column-inserts             dump data as INSERT commands with column names\n"));
 	printf(_("  --disable-dollar-quoting     disable dollar quoting, use SQL standard quoting\n"));
 	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
@@ -1434,6 +1438,8 @@ dumpTableData_copy(Archive *fout, void *dcontext)
 	}
 	else if (tdinfo->filtercond || tbinfo->ordercond)
 	{
+		if (cluster_order_no_seq_scan && tbinfo->ordercond)
+			appendPQExpBufferStr(q, "SET enable_seqscan TO off; ");
 		/* Note: this syntax is only supported in 8.2 and up */
 		appendPQExpBufferStr(q, "COPY (SELECT ");
 		/* klugery to get rid of parens in column list */
@@ -1453,6 +1459,8 @@ dumpTableData_copy(Archive *fout, void *dcontext)
 		if (tbinfo->ordercond)
 		  appendPQExpBuffer(q, "%s", tbinfo->ordercond);
 		appendPQExpBuffer(q, ") TO stdout;");
+		if (cluster_order_no_seq_scan && tbinfo->ordercond)
+			appendPQExpBufferStr(q, " SET enable_seqscan TO on;");
 	}
 	else
 	{
