@@ -195,6 +195,11 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
 		ctx->dataStart = _getFilePos(AH, ctx);
 	}
 
+	/* clear the ReopenPtr if we can't actually reopen the file (say STDIN) */
+	if (AH->fSpec == NULL || strcmp(AH->fSpec, "") == 0 || !ctx->hasSeek)
+	{
+		AH->ReopenPtr = NULL;
+	}
 }
 
 /*
