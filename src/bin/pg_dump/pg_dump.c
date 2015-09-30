@@ -5414,6 +5414,14 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 							  "SELECT t.tableoid, t.oid, "
 							  "t.relname AS indexname, "
 					 "pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef, "
+					 /*
+					  * FIXME - regex is not the best way to to do this, but
+					  * indexdef is consistent enough that it should work
+					  * Any missing corner cases worth worrying about?
+					  * A column named "foo ) WITH" would be problematic...
+					  * but would need a parser to cover all possible cases
+					  */
+					 "CASE WHEN i.indisclustered THEN 'ORDER BY ' || regexp_replace(pg_catalog.pg_get_indexdef(i.indexrelid), E'^CREATE (UNIQUE )?INDEX (CONCURRENTLY )?.* ON .* USING [^\\\\(]*\\\\((.*?)\\\\)($| WITH .*| WHERE .*| TABLESPACE .*)', E'\\\\3') ELSE NULL END AS indexdeforderclause, "
 							  "t.relnatts AS indnkeys, "
 							  "i.indkey, i.indisclustered, "
 							  "false AS indisreplident, t.relpages, "
