@@ -4,7 +4,7 @@
  *	  POSTGRES buffer manager definitions.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/bufmgr.h
@@ -36,8 +36,10 @@ typedef enum BufferAccessStrategyType
 typedef enum
 {
 	RBM_NORMAL,					/* Normal read */
-	RBM_ZERO,					/* Don't read from disk, caller will
-								 * initialize */
+	RBM_ZERO_AND_LOCK,			/* Don't read from disk, caller will
+								 * initialize. Also locks the page. */
+	RBM_ZERO_AND_CLEANUP_LOCK,	/* Like RBM_ZERO_AND_LOCK, but locks the page
+								 * in "cleanup" mode */
 	RBM_ZERO_ON_ERROR,			/* Read, but return an all-zeros page on error */
 	RBM_NORMAL_NO_LOG			/* Don't log page as invalid during WAL
 								 * replay; otherwise same as RBM_NORMAL */
@@ -55,12 +57,17 @@ extern int	target_prefetch_pages;
 
 /* in buf_init.c */
 extern PGDLLIMPORT char *BufferBlocks;
-extern PGDLLIMPORT int32 *PrivateRefCount;
+
+/* in guc.c */
+extern int	effective_io_concurrency;
 
 /* in localbuf.c */
 extern PGDLLIMPORT int NLocBuffer;
 extern PGDLLIMPORT Block *LocalBufferBlockPointers;
 extern PGDLLIMPORT int32 *LocalRefCount;
+
+/* upper limit for effective_io_concurrency */
+#define MAX_IO_CONCURRENCY 1000
 
 /* special block number for ReadBuffer() */
 #define P_NEW	InvalidBlockNumber		/* grow the file to get a new page */
@@ -99,24 +106,6 @@ extern PGDLLIMPORT int32 *LocalRefCount;
 ( \
 	AssertMacro((bufnum) <= NBuffers && (bufnum) >= -NLocBuffer), \
 	(bufnum) != InvalidBuffer  \
-)
-
-/*
- * BufferIsPinned
- *		True iff the buffer is pinned (also checks for valid buffer number).
- *
- *		NOTE: what we check here is that *this* backend holds a pin on
- *		the buffer.  We do not care whether some other backend does.
- */
-#define BufferIsPinned(bufnum) \
-( \
-	!BufferIsValid(bufnum) ? \
-		false \
-	: \
-		BufferIsLocal(bufnum) ? \
-			(LocalRefCount[-(bufnum) - 1] > 0) \
-		: \
-			(PrivateRefCount[(bufnum) - 1] > 0) \
 )
 
 /*
@@ -161,6 +150,7 @@ extern PGDLLIMPORT int32 *LocalRefCount;
 /*
  * prototypes for functions in bufmgr.c
  */
+extern bool ComputeIoConcurrency(int io_concurrency, double *target);
 extern void PrefetchBuffer(Relation reln, ForkNumber forkNum,
 			   BlockNumber blockNum);
 extern Buffer ReadBuffer(Relation reln, BlockNumber blockNum);

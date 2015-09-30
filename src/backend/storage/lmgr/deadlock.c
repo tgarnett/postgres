@@ -7,7 +7,7 @@
  * detection and resolution algorithms.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -608,7 +608,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
 				break;
 
 			/* Is there a conflict with this guy's request? */
-			if (((1 << proc->waitLockMode) & conflictMask) != 0)
+			if ((LOCKBIT_ON(proc->waitLockMode) & conflictMask) != 0)
 			{
 				/* This proc soft-blocks checkProc */
 				if (FindLockCycleRecurse(proc, depth + 1,
@@ -648,7 +648,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
 				break;
 
 			/* Is there a conflict with this guy's request? */
-			if (((1 << proc->waitLockMode) & conflictMask) != 0)
+			if ((LOCKBIT_ON(proc->waitLockMode) & conflictMask) != 0)
 			{
 				/* This proc soft-blocks checkProc */
 				if (FindLockCycleRecurse(proc, depth + 1,

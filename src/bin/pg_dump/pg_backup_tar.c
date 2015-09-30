@@ -27,12 +27,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
 
-#include "pg_backup.h"
 #include "pg_backup_archiver.h"
 #include "pg_backup_tar.h"
 #include "pg_backup_utils.h"
-#include "parallel.h"
 #include "pgtar.h"
 
 #include <sys/stat.h>
@@ -48,7 +47,7 @@ static int	_WriteByte(ArchiveHandle *AH, const int i);
 static int	_ReadByte(ArchiveHandle *);
 static void _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len);
 static void _ReadBuf(ArchiveHandle *AH, void *buf, size_t len);
-static void _CloseArchive(ArchiveHandle *AH);
+static void _CloseArchive(ArchiveHandle *AH, DumpOptions *dopt);
 static void _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt);
 static void _WriteExtraToc(ArchiveHandle *AH, TocEntry *te);
 static void _ReadExtraToc(ArchiveHandle *AH, TocEntry *te);
@@ -116,7 +115,7 @@ static void tarClose(ArchiveHandle *AH, TAR_MEMBER *TH);
 #ifdef __NOT_USED__
 static char *tarGets(char *buf, size_t len, TAR_MEMBER *th);
 #endif
-static int	tarPrintf(ArchiveHandle *AH, TAR_MEMBER *th, const char *fmt,...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 4)));
+static int	tarPrintf(ArchiveHandle *AH, TAR_MEMBER *th, const char *fmt,...) pg_attribute_printf(3, 4);
 
 static void _tarAddFile(ArchiveHandle *AH, TAR_MEMBER *th);
 static TAR_MEMBER *_tarPositionTo(ArchiveHandle *AH, const char *filename);
@@ -208,13 +207,6 @@ InitArchiveFmt_Tar(ArchiveHandle *AH)
 		/* setvbuf(ctx->tarFH, NULL, _IONBF, 0); */
 
 		ctx->hasSeek = checkSeek(ctx->tarFH);
-
-		if (AH->compression < 0 || AH->compression > 9)
-			AH->compression = Z_DEFAULT_COMPRESSION;
-
-		/* Don't compress into tar files unless asked to do so */
-		if (AH->compression == Z_DEFAULT_COMPRESSION)
-			AH->compression = 0;
 
 		/*
 		 * We don't support compression because reading the files back is not
@@ -387,7 +379,17 @@ tarOpen(ArchiveHandle *AH, const char *filename, char mode)
 	}
 	else
 	{
+		int			old_umask;
+
 		tm = pg_malloc0(sizeof(TAR_MEMBER));
+
+		/*
+		 * POSIX does not require, but permits, tmpfile() to restrict file
+		 * permissions.  Given an OS crash after we write data, the filesystem
+		 * might retain the data but forget tmpfile()'s unlink().  If so, the
+		 * file mode protects confidentiality of the data written.
+		 */
+		old_umask = umask(S_IRWXG | S_IRWXO);
 
 #ifndef WIN32
 		tm->tmpFH = tmpfile();
@@ -422,6 +424,8 @@ tarOpen(ArchiveHandle *AH, const char *filename, char mode)
 
 		if (tm->tmpFH == NULL)
 			exit_horribly(modulename, "could not generate temporary file name: %s\n", strerror(errno));
+
+		umask(old_umask);
 
 #ifdef HAVE_LIBZ
 
@@ -827,7 +831,7 @@ _ReadBuf(ArchiveHandle *AH, void *buf, size_t len)
 }
 
 static void
-_CloseArchive(ArchiveHandle *AH)
+_CloseArchive(ArchiveHandle *AH, DumpOptions *dopt)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	TAR_MEMBER *th;
@@ -850,7 +854,7 @@ _CloseArchive(ArchiveHandle *AH)
 		/*
 		 * Now send the data (tables & blobs)
 		 */
-		WriteDataChunks(AH, NULL);
+		WriteDataChunks(AH, dopt, NULL);
 
 		/*
 		 * Now this format wants to append a script which does a full restore
@@ -1083,7 +1087,7 @@ _tarAddFile(ArchiveHandle *AH, TAR_MEMBER *th)
 	fseeko(tmp, 0, SEEK_END);
 	th->fileLen = ftello(tmp);
 	if (th->fileLen < 0)
-		exit_horribly(modulename, "could not determine seek position in file: %s\n",
+		exit_horribly(modulename, "could not determine seek position in archive file: %s\n",
 					  strerror(errno));
 	fseeko(tmp, 0, SEEK_SET);
 

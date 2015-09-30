@@ -353,6 +353,44 @@ select count(*) from tenk1 x where
   x.unique1 in (select aa.f1 from int4_tbl aa,float8_tbl bb where aa.f1=bb.f1);
 rollback;
 
+--
+-- regression test: be sure we cope with proven-dummy append rels
+--
+explain (costs off)
+select aa, bb, unique1, unique1
+  from tenk1 right join b on aa = unique1
+  where bb < bb and bb is null;
+
+select aa, bb, unique1, unique1
+  from tenk1 right join b on aa = unique1
+  where bb < bb and bb is null;
+
+--
+-- regression test: check handling of empty-FROM subquery underneath outer join
+--
+explain (costs off)
+select * from int8_tbl i1 left join (int8_tbl i2 join
+  (select 123 as x) ss on i2.q1 = x) on i1.q2 = i2.q2
+order by 1, 2;
+
+select * from int8_tbl i1 left join (int8_tbl i2 join
+  (select 123 as x) ss on i2.q1 = x) on i1.q2 = i2.q2
+order by 1, 2;
+
+--
+-- regression test: check a case where join_clause_is_movable_into() gives
+-- an imprecise result, causing an assertion failure
+--
+select count(*)
+from
+  (select t3.tenthous as x1, coalesce(t1.stringu1, t2.stringu1) as x2
+   from tenk1 t1
+   left join tenk1 t2 on t1.unique1 = t2.unique1
+   join tenk1 t3 on t1.unique2 = t3.unique2) ss,
+  tenk1 t4,
+  tenk1 t5
+where t4.thousand = t5.unique1 and ss.x1 = t4.tenthous and ss.x2 = t5.stringu1;
+
 
 --
 -- Clean up
@@ -396,6 +434,10 @@ create temp table t2a () inherits (t2);
 insert into t2a values (200, 2001);
 
 select * from t1 left join t2 on (t1.a = t2.a);
+
+-- Test matching of column name with wrong alias
+
+select t1.x from t1 join t3 on (t1.a = t3.x);
 
 --
 -- regression test for 8.1 merge right join bug
@@ -442,6 +484,23 @@ LEFT JOIN (
         WHERE c.f1 IS NULL
 ) AS d ON (a.f1 = d.f1)
 WHERE d.f1 IS NULL;
+
+--
+-- regression test for proper handling of outer joins within antijoins
+--
+
+create temp table tt4x(c1 int, c2 int, c3 int);
+
+explain (costs off)
+select * from tt4x t1
+where not exists (
+  select 1 from tt4x t2
+    left join tt4x t3 on t2.c3 = t3.c1
+    left join ( select t5.c1 as c1
+                from tt4x t4 left join tt4x t5 on t4.c2 = t5.c1
+              ) a1 on t3.c2 = a1.c1
+  where t1.c1 = t2.c2
+);
 
 --
 -- regression test for problems of the sort depicted in bug #3494
@@ -764,6 +823,64 @@ select * from
 where thousand = (q1 + q2);
 
 --
+-- test ability to generate a suitable plan for a star-schema query
+--
+
+explain (costs off)
+select * from
+  tenk1, int8_tbl a, int8_tbl b
+where thousand = a.q1 and tenthous = b.q1 and a.q2 = 1 and b.q2 = 2;
+
+--
+-- test a corner case in which we shouldn't apply the star-schema optimization
+--
+
+explain (costs off)
+select t1.unique2, t1.stringu1, t2.unique1, t2.stringu2 from
+  tenk1 t1
+  inner join int4_tbl i1
+    left join (select v1.x2, v2.y1, 11 AS d1
+               from (values(1,0)) v1(x1,x2)
+               left join (values(3,1)) v2(y1,y2)
+               on v1.x1 = v2.y2) subq1
+    on (i1.f1 = subq1.x2)
+  on (t1.unique2 = subq1.d1)
+  left join tenk1 t2
+  on (subq1.y1 = t2.unique1)
+where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
+
+select t1.unique2, t1.stringu1, t2.unique1, t2.stringu2 from
+  tenk1 t1
+  inner join int4_tbl i1
+    left join (select v1.x2, v2.y1, 11 AS d1
+               from (values(1,0)) v1(x1,x2)
+               left join (values(3,1)) v2(y1,y2)
+               on v1.x1 = v2.y2) subq1
+    on (i1.f1 = subq1.x2)
+  on (t1.unique2 = subq1.d1)
+  left join tenk1 t2
+  on (subq1.y1 = t2.unique1)
+where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
+
+-- variant that isn't quite a star-schema case
+
+select ss1.d1 from
+  tenk1 as t1
+  inner join tenk1 as t2
+  on t1.tenthous = t2.ten
+  inner join
+    int8_tbl as i8
+    left join int4_tbl as i4
+      inner join (select 64::information_schema.cardinal_number as d1
+                  from tenk1 t3,
+                       lateral (select abs(t3.unique1) + random()) ss0(x)
+                  where t3.fivethous < 0) as ss1
+      on i4.f1 = ss1.d1
+    on i8.q1 = i4.f1
+  on t1.tenthous = ss1.d1
+where t1.unique1 < i4.f1;
+
+--
 -- test extraction of restriction OR clauses from join OR clause
 -- (we used to only do this for indexable clauses)
 --
@@ -774,6 +891,10 @@ select * from tenk1 a join tenk1 b on
 explain (costs off)
 select * from tenk1 a join tenk1 b on
   (a.unique1 = 1 and b.unique1 = 2) or (a.unique2 = 3 and b.ten = 4);
+explain (costs off)
+select * from tenk1 a join tenk1 b on
+  (a.unique1 = 1 and b.unique1 = 2) or
+  ((a.unique2 = 3 or a.unique2 = 7) and b.hundred = 4);
 
 --
 -- test placement of movable quals in a parameterized join tree
@@ -863,11 +984,11 @@ select f1, unique2, case when unique2 is null then f1 else 0 end
 explain (costs off)
 select a.unique1, b.unique1, c.unique1, coalesce(b.twothousand, a.twothousand)
   from tenk1 a left join tenk1 b on b.thousand = a.unique1                        left join tenk1 c on c.unique2 = coalesce(b.twothousand, a.twothousand)
-  where a.unique2 = 5530 and coalesce(b.twothousand, a.twothousand) = 44;
+  where a.unique2 < 10 and coalesce(b.twothousand, a.twothousand) = 44;
 
 select a.unique1, b.unique1, c.unique1, coalesce(b.twothousand, a.twothousand)
   from tenk1 a left join tenk1 b on b.thousand = a.unique1                        left join tenk1 c on c.unique2 = coalesce(b.twothousand, a.twothousand)
-  where a.unique2 = 5530 and coalesce(b.twothousand, a.twothousand) = 44;
+  where a.unique2 < 10 and coalesce(b.twothousand, a.twothousand) = 44;
 
 --
 -- check handling of join aliases when flattening multiple levels of subquery
@@ -901,6 +1022,100 @@ left join
 using (join_key);
 
 --
+-- test successful handling of nested outer joins with degenerate join quals
+--
+
+explain (verbose, costs off)
+select t1.* from
+  text_tbl t1
+  left join (select *, '***'::text as d1 from int8_tbl i8b1) b1
+    left join int8_tbl i8
+      left join (select *, null::int as d2 from int8_tbl i8b2) b2
+      on (i8.q1 = b2.q1)
+    on (b2.d2 = b1.q2)
+  on (t1.f1 = b1.d1)
+  left join int4_tbl i4
+  on (i8.q2 = i4.f1);
+
+select t1.* from
+  text_tbl t1
+  left join (select *, '***'::text as d1 from int8_tbl i8b1) b1
+    left join int8_tbl i8
+      left join (select *, null::int as d2 from int8_tbl i8b2) b2
+      on (i8.q1 = b2.q1)
+    on (b2.d2 = b1.q2)
+  on (t1.f1 = b1.d1)
+  left join int4_tbl i4
+  on (i8.q2 = i4.f1);
+
+explain (verbose, costs off)
+select t1.* from
+  text_tbl t1
+  left join (select *, '***'::text as d1 from int8_tbl i8b1) b1
+    left join int8_tbl i8
+      left join (select *, null::int as d2 from int8_tbl i8b2, int4_tbl i4b2) b2
+      on (i8.q1 = b2.q1)
+    on (b2.d2 = b1.q2)
+  on (t1.f1 = b1.d1)
+  left join int4_tbl i4
+  on (i8.q2 = i4.f1);
+
+select t1.* from
+  text_tbl t1
+  left join (select *, '***'::text as d1 from int8_tbl i8b1) b1
+    left join int8_tbl i8
+      left join (select *, null::int as d2 from int8_tbl i8b2, int4_tbl i4b2) b2
+      on (i8.q1 = b2.q1)
+    on (b2.d2 = b1.q2)
+  on (t1.f1 = b1.d1)
+  left join int4_tbl i4
+  on (i8.q2 = i4.f1);
+
+explain (verbose, costs off)
+select t1.* from
+  text_tbl t1
+  left join (select *, '***'::text as d1 from int8_tbl i8b1) b1
+    left join int8_tbl i8
+      left join (select *, null::int as d2 from int8_tbl i8b2, int4_tbl i4b2
+                 where q1 = f1) b2
+      on (i8.q1 = b2.q1)
+    on (b2.d2 = b1.q2)
+  on (t1.f1 = b1.d1)
+  left join int4_tbl i4
+  on (i8.q2 = i4.f1);
+
+select t1.* from
+  text_tbl t1
+  left join (select *, '***'::text as d1 from int8_tbl i8b1) b1
+    left join int8_tbl i8
+      left join (select *, null::int as d2 from int8_tbl i8b2, int4_tbl i4b2
+                 where q1 = f1) b2
+      on (i8.q1 = b2.q1)
+    on (b2.d2 = b1.q2)
+  on (t1.f1 = b1.d1)
+  left join int4_tbl i4
+  on (i8.q2 = i4.f1);
+
+explain (verbose, costs off)
+select * from
+  text_tbl t1
+  inner join int8_tbl i8
+  on i8.q2 = 456
+  right join text_tbl t2
+  on t1.f1 = 'doh!'
+  left join int4_tbl i4
+  on i8.q1 = i4.f1;
+
+select * from
+  text_tbl t1
+  inner join int8_tbl i8
+  on i8.q2 = 456
+  right join text_tbl t2
+  on t1.f1 = 'doh!'
+  left join int4_tbl i4
+  on i8.q1 = i4.f1;
+
+--
 -- test ability to push constants through outer join clauses
 --
 
@@ -909,6 +1124,26 @@ explain (costs off)
 
 explain (costs off)
   select * from tenk1 a full join tenk1 b using(unique2) where unique2 = 42;
+
+--
+-- test that quals attached to an outer join have correct semantics,
+-- specifically that they don't re-use expressions computed below the join;
+-- we force a mergejoin so that coalesce(b.q1, 1) appears as a join input
+--
+
+set enable_hashjoin to off;
+set enable_nestloop to off;
+
+explain (verbose, costs off)
+  select a.q2, b.q1
+    from int8_tbl a left join int8_tbl b on a.q2 = coalesce(b.q1, 1)
+    where coalesce(b.q1, 1) > 0;
+select a.q2, b.q1
+  from int8_tbl a left join int8_tbl b on a.q2 = coalesce(b.q1, 1)
+  where coalesce(b.q1, 1) > 0;
+
+reset enable_hashjoin;
+reset enable_nestloop;
 
 --
 -- test join removal
@@ -1037,6 +1272,46 @@ SELECT * FROM
 
 rollback;
 
+-- another join removal bug: we must clean up correctly when removing a PHV
+begin;
+
+create temp table uniquetbl (f1 text unique);
+
+explain (costs off)
+select t1.* from
+  uniquetbl as t1
+  left join (select *, '***'::text as d1 from uniquetbl) t2
+  on t1.f1 = t2.f1
+  left join uniquetbl t3
+  on t2.d1 = t3.f1;
+
+explain (costs off)
+select t0.*
+from
+ text_tbl t0
+ left join
+   (select case t1.ten when 0 then 'doh!'::text else null::text end as case1,
+           t1.stringu2
+     from tenk1 t1
+     join int4_tbl i4 ON i4.f1 = t1.unique2
+     left join uniquetbl u1 ON u1.f1 = t1.string4) ss
+  on t0.f1 = ss.case1
+where ss.stringu2 !~* ss.case1;
+
+select t0.*
+from
+ text_tbl t0
+ left join
+   (select case t1.ten when 0 then 'doh!'::text else null::text end as case1,
+           t1.stringu2
+     from tenk1 t1
+     join int4_tbl i4 ON i4.f1 = t1.unique2
+     left join uniquetbl u1 ON u1.f1 = t1.string4) ss
+  on t0.f1 = ss.case1
+where ss.stringu2 !~* ss.case1;
+
+rollback;
+
 -- bug #8444: we've historically allowed duplicate aliases within aliased JOINs
 
 select * from
@@ -1045,6 +1320,27 @@ select * from
   int8_tbl x join (int4_tbl x cross join int4_tbl y) j on q1 = y.f1; -- error
 select * from
   int8_tbl x join (int4_tbl x cross join int4_tbl y(ff)) j on q1 = f1; -- ok
+
+--
+-- Test hints given on incorrect column references are useful
+--
+
+select t1.uunique1 from
+  tenk1 t1 join tenk2 t2 on t1.two = t2.two; -- error, prefer "t1" suggestipn
+select t2.uunique1 from
+  tenk1 t1 join tenk2 t2 on t1.two = t2.two; -- error, prefer "t2" suggestion
+select uunique1 from
+  tenk1 t1 join tenk2 t2 on t1.two = t2.two; -- error, suggest both at once
+
+--
+-- Take care to reference the correct RTE
+--
+
+select atts.relid::regclass, s.* from pg_stats s join
+    pg_attribute a on s.attname = a.attname and s.tablename =
+    a.attrelid::regclass::text join (select unnest(indkey) attnum,
+    indexrelid from pg_index i) atts on atts.attnum = a.attnum where
+    schemaname != 'pg_catalog';
 
 --
 -- Test LATERAL
@@ -1099,6 +1395,13 @@ explain (costs off)
     tenk1 b join lateral (values(a.unique1)) ss(x) on b.unique2 = ss.x;
 select count(*) from tenk1 a,
   tenk1 b join lateral (values(a.unique1)) ss(x) on b.unique2 = ss.x;
+
+-- lateral with VALUES, no flattening possible
+explain (costs off)
+  select count(*) from tenk1 a,
+    tenk1 b join lateral (values(a.unique1),(-1)) ss(x) on b.unique2 = ss.x;
+select count(*) from tenk1 a,
+  tenk1 b join lateral (values(a.unique1),(-1)) ss(x) on b.unique2 = ss.x;
 
 -- lateral injecting a strange outer join condition
 explain (costs off)
@@ -1210,7 +1513,7 @@ select * from
     cross join
     lateral (select q1, coalesce(ss1.x,q2) as y from int8_tbl d) ss2
   ) on c.q2 = ss2.q1,
-  lateral (select ss2.y) ss3;
+  lateral (select ss2.y offset 0) ss3;
 
 -- case that breaks the old ph_may_need optimization
 explain (verbose, costs off)
@@ -1228,10 +1531,44 @@ select c.*,a.*,ss1.q1,ss2.q1,ss3.* from
 -- check processing of postponed quals (bug #9041)
 explain (verbose, costs off)
 select * from
-  (select 1 as x) x cross join (select 2 as y) y
+  (select 1 as x offset 0) x cross join (select 2 as y offset 0) y
   left join lateral (
-    select * from (select 3 as z) z where z.z = x.x
+    select * from (select 3 as z offset 0) z where z.z = x.x
   ) zz on zz.z = y.y;
+
+-- check we don't try to do a unique-ified semijoin with LATERAL
+explain (verbose, costs off)
+select * from
+  (values (0,9998), (1,1000)) v(id,x),
+  lateral (select f1 from int4_tbl
+           where f1 = any (select unique1 from tenk1
+                           where unique2 = v.x offset 0)) ss;
+select * from
+  (values (0,9998), (1,1000)) v(id,x),
+  lateral (select f1 from int4_tbl
+           where f1 = any (select unique1 from tenk1
+                           where unique2 = v.x offset 0)) ss;
+
+-- check proper extParam/allParam handling (this isn't exactly a LATERAL issue,
+-- but we can make the test case much more compact with LATERAL)
+explain (verbose, costs off)
+select * from (values (0), (1)) v(id),
+lateral (select * from int8_tbl t1,
+         lateral (select * from
+                    (select * from int8_tbl t2
+                     where q1 = any (select q2 from int8_tbl t3
+                                     where q2 = (select greatest(t1.q1,t2.q2))
+                                       and (select v.id=0)) offset 0) ss2) ss
+         where t1.q1 = ss.q2) ss0;
+
+select * from (values (0), (1)) v(id),
+lateral (select * from int8_tbl t1,
+         lateral (select * from
+                    (select * from int8_tbl t2
+                     where q1 = any (select q2 from int8_tbl t3
+                                     where q2 = (select greatest(t1.q1,t2.q2))
+                                       and (select v.id=0)) offset 0) ss2) ss
+         where t1.q1 = ss.q2) ss0;
 
 -- test some error cases where LATERAL should have been used but wasn't
 select f1,g from int4_tbl a, (select f1 as g) ss;

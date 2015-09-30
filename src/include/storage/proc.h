@@ -4,7 +4,7 @@
  *	  per-process shared memory data structures
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/proc.h
@@ -15,6 +15,7 @@
 #define _PROC_H_
 
 #include "access/xlogdefs.h"
+#include "lib/ilist.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
@@ -43,7 +44,7 @@ struct XidCache
 #define		PROC_IN_ANALYZE		0x04	/* currently running analyze */
 #define		PROC_VACUUM_FOR_WRAPAROUND	0x08	/* set by autovac only */
 #define		PROC_IN_LOGICAL_DECODING	0x10	/* currently doing logical
-												 * decoding */
+												 * decoding outside xact */
 
 /* flags reset at EOXact */
 #define		PROC_VACUUM_STATE_MASK \
@@ -56,6 +57,12 @@ struct XidCache
  * manager LWLocks.  See storage/lmgr/README for additional details.
  */
 #define		FP_LOCK_SLOTS_PER_BACKEND 16
+
+/*
+ * An invalid pgprocno.  Must be larger than the maximum number of PGPROC
+ * structures we could possibly have.  See comments for MAX_BACKENDS.
+ */
+#define INVALID_PGPROCNO		PG_INT32_MAX
 
 /*
  * Each backend has a PGPROC struct in shared memory.  There is also a list of
@@ -77,6 +84,7 @@ struct PGPROC
 {
 	/* proc->links MUST BE FIRST IN STRUCT (see ProcSleep,ProcWakeup,etc) */
 	SHM_QUEUE	links;			/* list link if process is in a list */
+	PGPROC	  **procgloballist;	/* procglobal list that owns this PGPROC */
 
 	PGSemaphoreData sem;		/* ONE semaphore to sleep on */
 	int			waitStatus;		/* STATUS_WAITING, STATUS_OK or STATUS_ERROR */
@@ -104,7 +112,7 @@ struct PGPROC
 	/* Info about LWLock the process is currently waiting for, if any. */
 	bool		lwWaiting;		/* true if waiting for an LW lock */
 	uint8		lwWaitMode;		/* lwlock mode being waited for */
-	struct PGPROC *lwWaitLink;	/* next waiter for same LW lock */
+	dlist_node	lwWaitLink;		/* position in LW lock wait list */
 
 	/* Info about lock the process is currently waiting for, if any. */
 	/* waitLock and waitProcLock are NULL if not currently waiting. */
@@ -132,6 +140,11 @@ struct PGPROC
 	SHM_QUEUE	myProcLocks[NUM_LOCK_PARTITIONS];
 
 	struct XidCache subxids;	/* cache for subtransaction XIDs */
+
+	/* Support for group XID clearing. */
+	bool			clearXid;
+	pg_atomic_uint32	nextClearXidElem;
+	TransactionId	backendLatestXid;
 
 	/* Per-backend LWLock.  Protects fields below. */
 	LWLock	   *backendLock;	/* protects the fields below */
@@ -194,6 +207,8 @@ typedef struct PROC_HDR
 	PGPROC	   *autovacFreeProcs;
 	/* Head of list of bgworker free PGPROC structures */
 	PGPROC	   *bgworkerFreeProcs;
+	/* First pgproc waiting for group XID clear */
+	pg_atomic_uint32 firstClearXidElem;
 	/* WALWriter process's latch */
 	Latch	   *walwriterLatch;
 	/* Checkpointer process's latch */
@@ -250,7 +265,7 @@ extern void ProcQueueInit(PROC_QUEUE *queue);
 extern int	ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable);
 extern PGPROC *ProcWakeup(PGPROC *proc, int waitStatus);
 extern void ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock);
-extern void CheckDeadLock(void);
+extern void CheckDeadLockAlert(void);
 extern bool IsWaitingForLock(void);
 extern void LockErrorCleanup(void);
 

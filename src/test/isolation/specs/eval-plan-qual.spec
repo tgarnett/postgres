@@ -8,11 +8,20 @@ setup
 {
  CREATE TABLE accounts (accountid text PRIMARY KEY, balance numeric not null);
  INSERT INTO accounts VALUES ('checking', 600), ('savings', 600);
+
+ CREATE TABLE p (a int, b int, c int);
+ CREATE TABLE c1 () INHERITS (p);
+ CREATE TABLE c2 () INHERITS (p);
+ CREATE TABLE c3 () INHERITS (p);
+ INSERT INTO c1 SELECT 0, a / 3, a % 3 FROM generate_series(0, 9) a;
+ INSERT INTO c2 SELECT 1, a / 3, a % 3 FROM generate_series(0, 9) a;
+ INSERT INTO c3 SELECT 2, a / 3, a % 3 FROM generate_series(0, 9) a;
 }
 
 teardown
 {
  DROP TABLE accounts;
+ DROP TABLE p CASCADE;
 }
 
 session "s1"
@@ -30,7 +39,30 @@ step "upsert1"	{
 	INSERT INTO accounts SELECT 'savings', 500
 	  WHERE NOT EXISTS (SELECT 1 FROM upsert);
 }
+
+# tests with table p check inheritance cases:
+# readp1/writep1/readp2 tests a bug where nodeLockRows did the wrong thing
+# when the first updated tuple was in a non-first child table.
+# writep2/returningp1 tests a memory allocation issue
+
+step "readp1"	{ SELECT tableoid::regclass, ctid, * FROM p WHERE b IN (0, 1) AND c = 0 FOR UPDATE; }
+step "writep1"	{ UPDATE p SET b = -1 WHERE a = 1 AND b = 1 AND c = 0; }
+step "writep2"	{ UPDATE p SET b = -b WHERE a = 1 AND c = 0; }
 step "c1"	{ COMMIT; }
+
+# these tests are meant to exercise EvalPlanQualFetchRowMarks,
+# ie, handling non-locked tables in an EvalPlanQual recheck
+
+step "partiallock"	{
+	SELECT * FROM accounts a1, accounts a2
+	  WHERE a1.accountid = a2.accountid
+	  FOR UPDATE OF a1;
+}
+step "lockwithvalues"	{
+	SELECT * FROM accounts a1, (values('checking'),('savings')) v(id)
+	  WHERE a1.accountid = v.id
+	  FOR UPDATE OF a1;
+}
 
 session "s2"
 setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; }
@@ -44,6 +76,11 @@ step "upsert2"	{
 	INSERT INTO accounts SELECT 'savings', 1234
 	  WHERE NOT EXISTS (SELECT 1 FROM upsert);
 }
+step "readp2"	{ SELECT tableoid::regclass, ctid, * FROM p WHERE b IN (0, 1) AND c = 0 FOR UPDATE; }
+step "returningp1" {
+	WITH u AS ( UPDATE p SET b = b WHERE a > 0 RETURNING * )
+	  SELECT * FROM u;
+}
 step "c2"	{ COMMIT; }
 
 session "s3"
@@ -54,3 +91,7 @@ teardown	{ COMMIT; }
 permutation "wx1" "wx2" "c1" "c2" "read"
 permutation "wy1" "wy2" "c1" "c2" "read"
 permutation "upsert1" "upsert2" "c1" "c2" "read"
+permutation "readp1" "writep1" "readp2" "c1" "c2"
+permutation "writep2" "returningp1" "c1" "c2"
+permutation "wx2" "partiallock" "c2" "c1" "read"
+permutation "wx2" "lockwithvalues" "c2" "c1" "read"

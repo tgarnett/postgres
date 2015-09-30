@@ -2,7 +2,7 @@
 #
 # Makefile for ecpg library
 #
-# Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/interfaces/ecpg/ecpglib/Makefile
@@ -16,7 +16,7 @@ include $(top_builddir)/src/Makefile.global
 PGFILEDESC = "ECPG - embedded SQL in C"
 NAME= ecpg
 SO_MAJOR_VERSION= 6
-SO_MINOR_VERSION= 7
+SO_MINOR_VERSION= 8
 
 override CPPFLAGS := -I../include -I$(top_srcdir)/src/interfaces/ecpg/include \
 	-I$(libpq_srcdir) -I$(top_builddir)/src/port -DFRONTEND $(CPPFLAGS)
@@ -38,11 +38,6 @@ SHLIB_LINK = -L../pgtypeslib -lpgtypes $(libpq) $(filter -lintl -lm, $(LIBS)) $(
 SHLIB_PREREQS = submake-libpq submake-pgtypeslib
 
 SHLIB_EXPORTS = exports.txt
-
-ifeq ($(PORTNAME), win32)
-# Link to shfolder.dll instead of shell32.dll
-SHLIB_LINK += -lshfolder
-endif
 
 PKG_CONFIG_REQUIRES_PRIVATE = libpq libpgtypes
 

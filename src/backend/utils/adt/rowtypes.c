@@ -3,7 +3,7 @@
  * rowtypes.c
  *	  I/O and comparison functions for generic composite types.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -43,7 +43,7 @@ typedef struct RecordIOData
 	Oid			record_type;
 	int32		record_typmod;
 	int			ncolumns;
-	ColumnIOData columns[1];	/* VARIABLE LENGTH ARRAY */
+	ColumnIOData columns[FLEXIBLE_ARRAY_MEMBER];
 } RecordIOData;
 
 /*
@@ -61,7 +61,7 @@ typedef struct RecordCompareData
 	int32		record1_typmod;
 	Oid			record2_type;
 	int32		record2_typmod;
-	ColumnCompareData columns[1];		/* VARIABLE LENGTH ARRAY */
+	ColumnCompareData columns[FLEXIBLE_ARRAY_MEMBER];
 } RecordCompareData;
 
 
@@ -73,12 +73,8 @@ record_in(PG_FUNCTION_ARGS)
 {
 	char	   *string = PG_GETARG_CSTRING(0);
 	Oid			tupType = PG_GETARG_OID(1);
-
-#ifdef NOT_USED
-	int32		typmod = PG_GETARG_INT32(2);
-#endif
+	int32		tupTypmod = PG_GETARG_INT32(2);
 	HeapTupleHeader result;
-	int32		tupTypmod;
 	TupleDesc	tupdesc;
 	HeapTuple	tuple;
 	RecordIOData *my_extra;
@@ -91,16 +87,17 @@ record_in(PG_FUNCTION_ARGS)
 	StringInfoData buf;
 
 	/*
-	 * Use the passed type unless it's RECORD; we can't support input of
-	 * anonymous types, mainly because there's no good way to figure out which
-	 * anonymous type is wanted.  Note that for RECORD, what we'll probably
-	 * actually get is RECORD's typelem, ie, zero.
+	 * Give a friendly error message if we did not get enough info to identify
+	 * the target record type.  (lookup_rowtype_tupdesc would fail anyway, but
+	 * with a non-user-friendly message.)  In ordinary SQL usage, we'll get -1
+	 * for typmod, since composite types and RECORD have no type modifiers at
+	 * the SQL level, and thus must fail for RECORD.  However some callers can
+	 * supply a valid typmod, and then we can do something useful for RECORD.
 	 */
-	if (tupType == InvalidOid || tupType == RECORDOID)
+	if (tupType == RECORDOID && tupTypmod < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		   errmsg("input of anonymous composite types is not implemented")));
-	tupTypmod = -1;				/* for all non-anonymous types */
 
 	/*
 	 * This comes from the composite type's pg_type.oid and stores system oids
@@ -120,8 +117,8 @@ record_in(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-							   sizeof(RecordIOData) - sizeof(ColumnIOData)
-							   + ncolumns * sizeof(ColumnIOData));
+							   offsetof(RecordIOData, columns) +
+							   ncolumns * sizeof(ColumnIOData));
 		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
@@ -131,8 +128,8 @@ record_in(PG_FUNCTION_ARGS)
 		my_extra->record_typmod != tupTypmod)
 	{
 		MemSet(my_extra, 0,
-			   sizeof(RecordIOData) - sizeof(ColumnIOData)
-			   + ncolumns * sizeof(ColumnIOData));
+			   offsetof(RecordIOData, columns) +
+			   ncolumns * sizeof(ColumnIOData));
 		my_extra->record_type = tupType;
 		my_extra->record_typmod = tupTypmod;
 		my_extra->ncolumns = ncolumns;
@@ -334,8 +331,8 @@ record_out(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-							   sizeof(RecordIOData) - sizeof(ColumnIOData)
-							   + ncolumns * sizeof(ColumnIOData));
+							   offsetof(RecordIOData, columns) +
+							   ncolumns * sizeof(ColumnIOData));
 		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
@@ -345,8 +342,8 @@ record_out(PG_FUNCTION_ARGS)
 		my_extra->record_typmod != tupTypmod)
 	{
 		MemSet(my_extra, 0,
-			   sizeof(RecordIOData) - sizeof(ColumnIOData)
-			   + ncolumns * sizeof(ColumnIOData));
+			   offsetof(RecordIOData, columns) +
+			   ncolumns * sizeof(ColumnIOData));
 		my_extra->record_type = tupType;
 		my_extra->record_typmod = tupTypmod;
 		my_extra->ncolumns = ncolumns;
@@ -449,12 +446,8 @@ record_recv(PG_FUNCTION_ARGS)
 {
 	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
 	Oid			tupType = PG_GETARG_OID(1);
-
-#ifdef NOT_USED
-	int32		typmod = PG_GETARG_INT32(2);
-#endif
+	int32		tupTypmod = PG_GETARG_INT32(2);
 	HeapTupleHeader result;
-	int32		tupTypmod;
 	TupleDesc	tupdesc;
 	HeapTuple	tuple;
 	RecordIOData *my_extra;
@@ -466,16 +459,18 @@ record_recv(PG_FUNCTION_ARGS)
 	bool	   *nulls;
 
 	/*
-	 * Use the passed type unless it's RECORD; we can't support input of
-	 * anonymous types, mainly because there's no good way to figure out which
-	 * anonymous type is wanted.  Note that for RECORD, what we'll probably
-	 * actually get is RECORD's typelem, ie, zero.
+	 * Give a friendly error message if we did not get enough info to identify
+	 * the target record type.  (lookup_rowtype_tupdesc would fail anyway, but
+	 * with a non-user-friendly message.)  In ordinary SQL usage, we'll get -1
+	 * for typmod, since composite types and RECORD have no type modifiers at
+	 * the SQL level, and thus must fail for RECORD.  However some callers can
+	 * supply a valid typmod, and then we can do something useful for RECORD.
 	 */
-	if (tupType == InvalidOid || tupType == RECORDOID)
+	if (tupType == RECORDOID && tupTypmod < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		   errmsg("input of anonymous composite types is not implemented")));
-	tupTypmod = -1;				/* for all non-anonymous types */
+
 	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
 	ncolumns = tupdesc->natts;
 
@@ -489,8 +484,8 @@ record_recv(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-							   sizeof(RecordIOData) - sizeof(ColumnIOData)
-							   + ncolumns * sizeof(ColumnIOData));
+							   offsetof(RecordIOData, columns) +
+							   ncolumns * sizeof(ColumnIOData));
 		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
@@ -500,8 +495,8 @@ record_recv(PG_FUNCTION_ARGS)
 		my_extra->record_typmod != tupTypmod)
 	{
 		MemSet(my_extra, 0,
-			   sizeof(RecordIOData) - sizeof(ColumnIOData)
-			   + ncolumns * sizeof(ColumnIOData));
+			   offsetof(RecordIOData, columns) +
+			   ncolumns * sizeof(ColumnIOData));
 		my_extra->record_type = tupType;
 		my_extra->record_typmod = tupTypmod;
 		my_extra->ncolumns = ncolumns;
@@ -677,8 +672,8 @@ record_send(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-							   sizeof(RecordIOData) - sizeof(ColumnIOData)
-							   + ncolumns * sizeof(ColumnIOData));
+							   offsetof(RecordIOData, columns) +
+							   ncolumns * sizeof(ColumnIOData));
 		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
@@ -688,8 +683,8 @@ record_send(PG_FUNCTION_ARGS)
 		my_extra->record_typmod != tupTypmod)
 	{
 		MemSet(my_extra, 0,
-			   sizeof(RecordIOData) - sizeof(ColumnIOData)
-			   + ncolumns * sizeof(ColumnIOData));
+			   offsetof(RecordIOData, columns) +
+			   ncolumns * sizeof(ColumnIOData));
 		my_extra->record_type = tupType;
 		my_extra->record_typmod = tupTypmod;
 		my_extra->ncolumns = ncolumns;
@@ -829,8 +824,8 @@ record_cmp(FunctionCallInfo fcinfo)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-						sizeof(RecordCompareData) - sizeof(ColumnCompareData)
-							   + ncols * sizeof(ColumnCompareData));
+							   offsetof(RecordCompareData, columns) +
+							   ncols * sizeof(ColumnCompareData));
 		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
 		my_extra->ncolumns = ncols;
 		my_extra->record1_type = InvalidOid;
@@ -1065,8 +1060,8 @@ record_eq(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-						sizeof(RecordCompareData) - sizeof(ColumnCompareData)
-							   + ncols * sizeof(ColumnCompareData));
+							   offsetof(RecordCompareData, columns) +
+							   ncols * sizeof(ColumnCompareData));
 		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
 		my_extra->ncolumns = ncols;
 		my_extra->record1_type = InvalidOid;
@@ -1324,8 +1319,8 @@ record_image_cmp(FunctionCallInfo fcinfo)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-						sizeof(RecordCompareData) - sizeof(ColumnCompareData)
-							   + ncols * sizeof(ColumnCompareData));
+							   offsetof(RecordCompareData, columns) +
+							   ncols * sizeof(ColumnCompareData));
 		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
 		my_extra->ncolumns = ncols;
 		my_extra->record1_type = InvalidOid;
@@ -1601,8 +1596,8 @@ record_image_eq(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-						sizeof(RecordCompareData) - sizeof(ColumnCompareData)
-							   + ncols * sizeof(ColumnCompareData));
+							   offsetof(RecordCompareData, columns) +
+							   ncols * sizeof(ColumnCompareData));
 		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
 		my_extra->ncolumns = ncols;
 		my_extra->record1_type = InvalidOid;

@@ -111,13 +111,11 @@ SET LOCAL TIME ZONE -8;
 select to_json(timestamptz '2014-05-28 12:22:35.614298-04');
 COMMIT;
 
--- unicode escape - backslash is not escaped
+select to_json(date '2014-05-28');
 
-select to_json(text '\uabcd');
-
--- any other backslash is escaped
-
-select to_json(text '\abcd');
+select to_json(date 'Infinity');
+select to_json(timestamp 'Infinity');
+select to_json(timestamptz 'Infinity');
 
 --json_agg
 
@@ -128,7 +126,12 @@ SELECT json_agg(q)
          FROM generate_series(1,2) x,
               generate_series(4,5) y) q;
 
-SELECT json_agg(q)
+SELECT json_agg(q ORDER BY x, y)
+  FROM rows q;
+
+UPDATE rows SET x = NULL WHERE x = 1;
+
+SELECT json_agg(q ORDER BY x NULLS FIRST, y)
   FROM rows q;
 
 -- non-numeric output
@@ -186,6 +189,10 @@ SELECT test_json -> 2
 FROM test_json
 WHERE json_type = 'array';
 
+SELECT test_json -> -1
+FROM test_json
+WHERE json_type = 'array';
+
 SELECT test_json -> 2
 FROM test_json
 WHERE json_type = 'object';
@@ -238,6 +245,32 @@ select (test_json->>3) is null as expect_true
 from test_json
 where json_type = 'array';
 
+-- corner cases
+
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json -> null::text;
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json -> null::int;
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json -> 1;
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json -> -1;
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json -> 'z';
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json -> '';
+select '[{"b": "c"}, {"b": "cc"}]'::json -> 1;
+select '[{"b": "c"}, {"b": "cc"}]'::json -> 3;
+select '[{"b": "c"}, {"b": "cc"}]'::json -> 'z';
+select '{"a": "c", "b": null}'::json -> 'b';
+select '"foo"'::json -> 1;
+select '"foo"'::json -> 'z';
+
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json ->> null::text;
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json ->> null::int;
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json ->> 1;
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json ->> 'z';
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json ->> '';
+select '[{"b": "c"}, {"b": "cc"}]'::json ->> 1;
+select '[{"b": "c"}, {"b": "cc"}]'::json ->> 3;
+select '[{"b": "c"}, {"b": "cc"}]'::json ->> 'z';
+select '{"a": "c", "b": null}'::json ->> 'b';
+select '"foo"'::json ->> 1;
+select '"foo"'::json ->> 'z';
 
 -- array length
 
@@ -281,20 +314,54 @@ select '{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}'::json#>array['f4','f6'];
 select '{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}'::json#>array['f2'];
 select '{"f2":["f3",1],"f4":{"f5":99,"f6":"stringy"}}'::json#>array['f2','0'];
 select '{"f2":["f3",1],"f4":{"f5":99,"f6":"stringy"}}'::json#>array['f2','1'];
+
 select '{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}'::json#>>array['f4','f6'];
 select '{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}'::json#>>array['f2'];
 select '{"f2":["f3",1],"f4":{"f5":99,"f6":"stringy"}}'::json#>>array['f2','0'];
 select '{"f2":["f3",1],"f4":{"f5":99,"f6":"stringy"}}'::json#>>array['f2','1'];
 
--- same using array literals
-select '{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}'::json#>'{f4,f6}';
-select '{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}'::json#>'{f2}';
-select '{"f2":["f3",1],"f4":{"f5":99,"f6":"stringy"}}'::json#>'{f2,0}';
-select '{"f2":["f3",1],"f4":{"f5":99,"f6":"stringy"}}'::json#>'{f2,1}';
-select '{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}'::json#>>'{f4,f6}';
-select '{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}'::json#>>'{f2}';
-select '{"f2":["f3",1],"f4":{"f5":99,"f6":"stringy"}}'::json#>>'{f2,0}';
-select '{"f2":["f3",1],"f4":{"f5":99,"f6":"stringy"}}'::json#>>'{f2,1}';
+-- corner cases for same
+select '{"a": {"b":{"c": "foo"}}}'::json #> '{}';
+select '[1,2,3]'::json #> '{}';
+select '"foo"'::json #> '{}';
+select '42'::json #> '{}';
+select 'null'::json #> '{}';
+select '{"a": {"b":{"c": "foo"}}}'::json #> array['a'];
+select '{"a": {"b":{"c": "foo"}}}'::json #> array['a', null];
+select '{"a": {"b":{"c": "foo"}}}'::json #> array['a', ''];
+select '{"a": {"b":{"c": "foo"}}}'::json #> array['a','b'];
+select '{"a": {"b":{"c": "foo"}}}'::json #> array['a','b','c'];
+select '{"a": {"b":{"c": "foo"}}}'::json #> array['a','b','c','d'];
+select '{"a": {"b":{"c": "foo"}}}'::json #> array['a','z','c'];
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json #> array['a','1','b'];
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json #> array['a','z','b'];
+select '[{"b": "c"}, {"b": "cc"}]'::json #> array['1','b'];
+select '[{"b": "c"}, {"b": "cc"}]'::json #> array['z','b'];
+select '[{"b": "c"}, {"b": null}]'::json #> array['1','b'];
+select '"foo"'::json #> array['z'];
+select '42'::json #> array['f2'];
+select '42'::json #> array['0'];
+
+select '{"a": {"b":{"c": "foo"}}}'::json #>> '{}';
+select '[1,2,3]'::json #>> '{}';
+select '"foo"'::json #>> '{}';
+select '42'::json #>> '{}';
+select 'null'::json #>> '{}';
+select '{"a": {"b":{"c": "foo"}}}'::json #>> array['a'];
+select '{"a": {"b":{"c": "foo"}}}'::json #>> array['a', null];
+select '{"a": {"b":{"c": "foo"}}}'::json #>> array['a', ''];
+select '{"a": {"b":{"c": "foo"}}}'::json #>> array['a','b'];
+select '{"a": {"b":{"c": "foo"}}}'::json #>> array['a','b','c'];
+select '{"a": {"b":{"c": "foo"}}}'::json #>> array['a','b','c','d'];
+select '{"a": {"b":{"c": "foo"}}}'::json #>> array['a','z','c'];
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json #>> array['a','1','b'];
+select '{"a": [{"b": "c"}, {"b": "cc"}]}'::json #>> array['a','z','b'];
+select '[{"b": "c"}, {"b": "cc"}]'::json #>> array['1','b'];
+select '[{"b": "c"}, {"b": "cc"}]'::json #>> array['z','b'];
+select '[{"b": "c"}, {"b": null}]'::json #>> array['1','b'];
+select '"foo"'::json #>> array['z'];
+select '42'::json #>> array['f2'];
+select '42'::json #>> array['0'];
 
 -- array_elements
 
@@ -342,9 +409,17 @@ select json '{ "a":  "\ude04X" }' -> 'a'; -- orphan low surrogate
 
 --handling of simple unicode escapes
 
+select json '{ "a":  "the Copyright \u00a9 sign" }' as correct_in_utf8;
+select json '{ "a":  "dollar \u0024 character" }' as correct_everywhere;
+select json '{ "a":  "dollar \\u0024 character" }' as not_an_escape;
+select json '{ "a":  "null \u0000 escape" }' as not_unescaped;
+select json '{ "a":  "null \\u0000 escape" }' as not_an_escape;
+
 select json '{ "a":  "the Copyright \u00a9 sign" }' ->> 'a' as correct_in_utf8;
 select json '{ "a":  "dollar \u0024 character" }' ->> 'a' as correct_everywhere;
-select json '{ "a":  "null \u0000 escape" }' ->> 'a' as not_unescaped;
+select json '{ "a":  "dollar \\u0024 character" }' ->> 'a' as not_an_escape;
+select json '{ "a":  "null \u0000 escape" }' ->> 'a' as fails;
+select json '{ "a":  "null \\u0000 escape" }' ->> 'a' as not_an_escape;
 
 --json_typeof() function
 select value, json_typeof(value)
@@ -372,7 +447,6 @@ SELECT json_build_object(
        'd', json_build_object('e',array[9,8,7]::int[],
            'f', (select row_to_json(r) from ( select relkind, oid::regclass as name from pg_class where relname = 'pg_class') r)));
 
-
 -- empty objects/arrays
 SELECT json_build_array();
 
@@ -397,6 +471,11 @@ INSERT INTO foo VALUES (847003,'sub-alpha','GESS90');
 
 SELECT json_build_object('turbines',json_object_agg(serial_num,json_build_object('name',name,'type',type)))
 FROM foo;
+
+SELECT json_object_agg(name, type) FROM foo;
+
+INSERT INTO foo VALUES (999999, NULL, 'bar');
+SELECT json_object_agg(name, type) FROM foo;
 
 -- json_object
 
@@ -450,3 +529,23 @@ select * from json_to_recordset('[{"a":1,"b":"foo","d":false},{"a":2,"b":"bar","
 
 select * from json_to_recordset('[{"a":1,"b":{"d":"foo"},"c":true},{"a":2,"c":false,"b":{"d":"bar"}}]')
     as x(a int, b json, c boolean);
+
+
+-- json_strip_nulls
+
+select json_strip_nulls(null);
+
+select json_strip_nulls('1');
+
+select json_strip_nulls('"a string"');
+
+select json_strip_nulls('null');
+
+select json_strip_nulls('[1,2,null,3,4]');
+
+select json_strip_nulls('{"a":1,"b":null,"c":[2,null,3],"d":{"e":4,"f":null}}');
+
+select json_strip_nulls('[1,{"a":1,"b":null,"c":2},3]');
+
+-- an empty object is not null and should not be stripped
+select json_strip_nulls('{"a": {"b": null, "c": null}, "d": {} }');

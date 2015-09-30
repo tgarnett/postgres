@@ -228,6 +228,7 @@ ALTER TABLE constraint_rename_test RENAME CONSTRAINT con3 TO con3foo; -- ok
 \d constraint_rename_test2
 DROP TABLE constraint_rename_test2;
 DROP TABLE constraint_rename_test;
+ALTER TABLE IF EXISTS constraint_not_exist RENAME CONSTRAINT con3 TO con3foo; -- ok
 ALTER TABLE IF EXISTS constraint_rename_test ADD CONSTRAINT con4 UNIQUE (a);
 
 -- FOREIGN KEY CONSTRAINT adding TEST
@@ -1174,6 +1175,7 @@ insert into anothertab (atcol1, atcol2) values (default, false);
 select * from anothertab;
 
 alter table anothertab alter column atcol1 type boolean; -- fails
+alter table anothertab alter column atcol1 type boolean using atcol1::int; -- fails
 alter table anothertab alter column atcol1 type integer;
 
 select * from anothertab;
@@ -1254,12 +1256,23 @@ ALTER TABLE test_inh_check ALTER COLUMN a TYPE numeric;
 \d test_inh_check
 \d test_inh_check_child
 
+-- check for rollback of ANALYZE corrupting table property flags (bug #11638)
+CREATE TABLE check_fk_presence_1 (id int PRIMARY KEY, t text);
+CREATE TABLE check_fk_presence_2 (id int REFERENCES check_fk_presence_1, t text);
+BEGIN;
+ALTER TABLE check_fk_presence_2 DROP CONSTRAINT check_fk_presence_2_id_fkey;
+ANALYZE check_fk_presence_2;
+ROLLBACK;
+\d check_fk_presence_2
+DROP TABLE check_fk_presence_1, check_fk_presence_2;
+
 --
 -- lock levels
 --
 drop type lockmodes;
 create type lockmodes as enum (
- 'AccessShareLock'
+ 'SIReadLock'
+,'AccessShareLock'
 ,'RowShareLock'
 ,'RowExclusiveLock'
 ,'ShareUpdateExclusiveLock'
@@ -1319,6 +1332,11 @@ begin; alter table alterlock alter column f2 set (n_distinct = 1);
 select * from my_locks order by 1;
 rollback;
 
+-- test that mixing options with different lock levels works as expected
+begin; alter table alterlock set (autovacuum_enabled = off, fillfactor = 80);
+select * from my_locks order by 1;
+commit;
+
 begin; alter table alterlock alter column f2 set storage extended;
 select * from my_locks order by 1;
 rollback;
@@ -1350,6 +1368,39 @@ commit;
 begin;
 alter table alterlock2 validate constraint alterlock2nv;
 select * from my_locks order by 1;
+rollback;
+
+create or replace view my_locks as
+select case when c.relname like 'pg_toast%' then 'pg_toast' else c.relname end, max(mode::lockmodes) as max_lockmode
+from pg_locks l join pg_class c on l.relation = c.oid
+where virtualtransaction = (
+        select virtualtransaction
+        from pg_locks
+        where transactionid = txid_current()::integer)
+and locktype = 'relation'
+and relnamespace != (select oid from pg_namespace where nspname = 'pg_catalog')
+and c.relname = 'my_locks'
+group by c.relname;
+
+-- raise exception
+alter table my_locks set (autovacuum_enabled = false);
+alter view my_locks set (autovacuum_enabled = false);
+alter table my_locks reset (autovacuum_enabled);
+alter view my_locks reset (autovacuum_enabled);
+
+begin;
+alter view my_locks set (security_barrier=off);
+select * from my_locks order by 1;
+alter view my_locks reset (security_barrier);
+rollback;
+
+-- this test intentionally applies the ALTER TABLE command against a view, but
+-- uses a view option so we expect this to succeed. This form of SQL is
+-- accepted for historical reasons, as shown in the docs for ALTER VIEW
+begin;
+alter table my_locks set (security_barrier=off);
+select * from my_locks order by 1;
+alter table my_locks reset (security_barrier);
 rollback;
 
 -- cleanup
@@ -1582,6 +1633,42 @@ ALTER TABLE IF EXISTS tt8 SET SCHEMA alter2;
 DROP TABLE alter2.tt8;
 DROP SCHEMA alter2;
 
+
+-- Check that comments on constraints and indexes are not lost at ALTER TABLE.
+CREATE TABLE comment_test (
+  id int,
+  positive_col int CHECK (positive_col > 0),
+  indexed_col int,
+  CONSTRAINT comment_test_pk PRIMARY KEY (id));
+CREATE INDEX comment_test_index ON comment_test(indexed_col);
+
+COMMENT ON COLUMN comment_test.id IS 'Column ''id'' on comment_test';
+COMMENT ON INDEX comment_test_index IS 'Simple index on comment_test';
+COMMENT ON CONSTRAINT comment_test_positive_col_check ON comment_test IS 'CHECK constraint on comment_test.positive_col';
+COMMENT ON CONSTRAINT comment_test_pk ON comment_test IS 'PRIMARY KEY constraint of comment_test';
+COMMENT ON INDEX comment_test_pk IS 'Index backing the PRIMARY KEY of comment_test';
+
+SELECT col_description('comment_test'::regclass, 1) as comment;
+SELECT indexrelid::regclass::text as index, obj_description(indexrelid, 'pg_class') as comment FROM pg_index where indrelid = 'comment_test'::regclass ORDER BY 1, 2;
+SELECT conname as constraint, obj_description(oid, 'pg_constraint') as comment FROM pg_constraint where conrelid = 'comment_test'::regclass ORDER BY 1, 2;
+
+-- Change the datatype of all the columns. ALTER TABLE is optimized to not
+-- rebuild an index if the new data type is binary compatible with the old
+-- one. Check do a dummy ALTER TABLE that doesn't change the datatype
+-- first, to test that no-op codepath, and another one that does.
+ALTER TABLE comment_test ALTER COLUMN indexed_col SET DATA TYPE int;
+ALTER TABLE comment_test ALTER COLUMN indexed_col SET DATA TYPE text;
+ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE int;
+ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE text;
+ALTER TABLE comment_test ALTER COLUMN positive_col SET DATA TYPE int;
+ALTER TABLE comment_test ALTER COLUMN positive_col SET DATA TYPE bigint;
+
+-- Check that the comments are intact.
+SELECT col_description('comment_test'::regclass, 1) as comment;
+SELECT indexrelid::regclass::text as index, obj_description(indexrelid, 'pg_class') as comment FROM pg_index where indrelid = 'comment_test'::regclass ORDER BY 1, 2;
+SELECT conname as constraint, obj_description(oid, 'pg_constraint') as comment FROM pg_constraint where conrelid = 'comment_test'::regclass ORDER BY 1, 2;
+
+
 -- Check that we map relation oids to filenodes and back correctly.  Only
 -- display bad mappings so the test output doesn't change all the time.  A
 -- filenode function call can return NULL for a relation dropped concurrently
@@ -1624,3 +1711,86 @@ TRUNCATE old_system_table;
 ALTER TABLE old_system_table DROP CONSTRAINT new_system_table_pkey;
 ALTER TABLE old_system_table DROP COLUMN othercol;
 DROP TABLE old_system_table;
+
+-- set logged
+CREATE UNLOGGED TABLE unlogged1(f1 SERIAL PRIMARY KEY, f2 TEXT);
+-- check relpersistence of an unlogged table
+SELECT relname, relkind, relpersistence FROM pg_class WHERE relname ~ '^unlogged1'
+UNION ALL
+SELECT 'toast table', t.relkind, t.relpersistence FROM pg_class r JOIN pg_class t ON t.oid = r.reltoastrelid WHERE r.relname ~ '^unlogged1'
+UNION ALL
+SELECT 'toast index', ri.relkind, ri.relpersistence FROM pg_class r join pg_class t ON t.oid = r.reltoastrelid JOIN pg_index i ON i.indrelid = t.oid JOIN pg_class ri ON ri.oid = i.indexrelid WHERE r.relname ~ '^unlogged1'
+ORDER BY relname;
+CREATE UNLOGGED TABLE unlogged2(f1 SERIAL PRIMARY KEY, f2 INTEGER REFERENCES unlogged1); -- foreign key
+CREATE UNLOGGED TABLE unlogged3(f1 SERIAL PRIMARY KEY, f2 INTEGER REFERENCES unlogged3); -- self-referencing foreign key
+ALTER TABLE unlogged3 SET LOGGED; -- skip self-referencing foreign key
+ALTER TABLE unlogged2 SET LOGGED; -- fails because a foreign key to an unlogged table exists
+ALTER TABLE unlogged1 SET LOGGED;
+-- check relpersistence of an unlogged table after changing to permament
+SELECT relname, relkind, relpersistence FROM pg_class WHERE relname ~ '^unlogged1'
+UNION ALL
+SELECT 'toast table', t.relkind, t.relpersistence FROM pg_class r JOIN pg_class t ON t.oid = r.reltoastrelid WHERE r.relname ~ '^unlogged1'
+UNION ALL
+SELECT 'toast index', ri.relkind, ri.relpersistence FROM pg_class r join pg_class t ON t.oid = r.reltoastrelid JOIN pg_index i ON i.indrelid = t.oid JOIN pg_class ri ON ri.oid = i.indexrelid WHERE r.relname ~ '^unlogged1'
+ORDER BY relname;
+ALTER TABLE unlogged1 SET LOGGED; -- silently do nothing
+DROP TABLE unlogged3;
+DROP TABLE unlogged2;
+DROP TABLE unlogged1;
+-- set unlogged
+CREATE TABLE logged1(f1 SERIAL PRIMARY KEY, f2 TEXT);
+-- check relpersistence of a permanent table
+SELECT relname, relkind, relpersistence FROM pg_class WHERE relname ~ '^logged1'
+UNION ALL
+SELECT 'toast table', t.relkind, t.relpersistence FROM pg_class r JOIN pg_class t ON t.oid = r.reltoastrelid WHERE r.relname ~ '^logged1'
+UNION ALL
+SELECT 'toast index', ri.relkind, ri.relpersistence FROM pg_class r join pg_class t ON t.oid = r.reltoastrelid JOIN pg_index i ON i.indrelid = t.oid JOIN pg_class ri ON ri.oid = i.indexrelid WHERE r.relname ~ '^logged1'
+ORDER BY relname;
+CREATE TABLE logged2(f1 SERIAL PRIMARY KEY, f2 INTEGER REFERENCES logged1); -- foreign key
+CREATE TABLE logged3(f1 SERIAL PRIMARY KEY, f2 INTEGER REFERENCES logged3); -- self-referencing foreign key
+ALTER TABLE logged1 SET UNLOGGED; -- fails because a foreign key from a permanent table exists
+ALTER TABLE logged3 SET UNLOGGED; -- skip self-referencing foreign key
+ALTER TABLE logged2 SET UNLOGGED;
+ALTER TABLE logged1 SET UNLOGGED;
+-- check relpersistence of a permanent table after changing to unlogged
+SELECT relname, relkind, relpersistence FROM pg_class WHERE relname ~ '^logged1'
+UNION ALL
+SELECT 'toast table', t.relkind, t.relpersistence FROM pg_class r JOIN pg_class t ON t.oid = r.reltoastrelid WHERE r.relname ~ '^logged1'
+UNION ALL
+SELECT 'toast index', ri.relkind, ri.relpersistence FROM pg_class r join pg_class t ON t.oid = r.reltoastrelid JOIN pg_index i ON i.indrelid = t.oid JOIN pg_class ri ON ri.oid = i.indexrelid WHERE r.relname ~ '^logged1'
+ORDER BY relname;
+ALTER TABLE logged1 SET UNLOGGED; -- silently do nothing
+DROP TABLE logged3;
+DROP TABLE logged2;
+DROP TABLE logged1;
+
+-- test ADD COLUMN IF NOT EXISTS
+CREATE TABLE test_add_column(c1 integer);
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN c2 integer;
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN c2 integer; -- fail because c2 already exists
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN IF NOT EXISTS c2 integer; -- skipping because c2 already exists
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN c2 integer, -- fail because c2 already exists
+	ADD COLUMN c3 integer;
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
+	ADD COLUMN c3 integer; -- fail because c3 already exists
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
+	ADD COLUMN IF NOT EXISTS c3 integer; -- skipping because c3 already exists
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
+	ADD COLUMN IF NOT EXISTS c3 integer, -- skipping because c3 already exists
+	ADD COLUMN c4 integer;
+\d test_add_column
+DROP TABLE test_add_column;

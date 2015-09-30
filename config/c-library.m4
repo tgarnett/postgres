@@ -8,13 +8,13 @@
 # HAVE_INT_TIMEZONE.
 AC_DEFUN([PGAC_VAR_INT_TIMEZONE],
 [AC_CACHE_CHECK(for int timezone, pgac_cv_var_int_timezone,
-[AC_TRY_LINK([#include <time.h>
+[AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <time.h>
 int res;],
   [#ifndef __CYGWIN__
 res = timezone / 60;
 #else
 res = _timezone / 60;
-#endif],
+#endif])],
   [pgac_cv_var_int_timezone=yes],
   [pgac_cv_var_int_timezone=no])])
 if test x"$pgac_cv_var_int_timezone" = xyes ; then
@@ -41,13 +41,13 @@ if test "$ac_cv_member_struct_tm_tm_zone" = yes; then
              `HAVE_STRUCT_TM_TM_ZONE' instead.])
 fi
 AC_CACHE_CHECK(for tzname, ac_cv_var_tzname,
-[AC_TRY_LINK(
-[#include <time.h>
+[AC_LINK_IFELSE([AC_LANG_PROGRAM(
+[[#include <time.h>
 #ifndef tzname /* For SGI.  */
 extern char *tzname[]; /* RS6000 and others reject char **tzname.  */
 #endif
-],
-[atoi(*tzname);], ac_cv_var_tzname=yes, ac_cv_var_tzname=no)])
+]],
+[atoi(*tzname);])], ac_cv_var_tzname=yes, ac_cv_var_tzname=no)])
 if test $ac_cv_var_tzname = yes; then
     AC_DEFINE(HAVE_TZNAME, 1,
               [Define to 1 if you have the external array `tzname'.])
@@ -62,10 +62,10 @@ fi
 AC_DEFUN([PGAC_FUNC_GETTIMEOFDAY_1ARG],
 [AC_CACHE_CHECK(whether gettimeofday takes only one argument,
 pgac_cv_func_gettimeofday_1arg,
-[AC_TRY_COMPILE([#include <sys/time.h>],
+[AC_COMPILE_IFELSE([AC_LANG_PROGRAM([#include <sys/time.h>],
 [struct timeval *tp;
 struct timezone *tzp;
-gettimeofday(tp,tzp);],
+gettimeofday(tp,tzp);])],
 [pgac_cv_func_gettimeofday_1arg=no],
 [pgac_cv_func_gettimeofday_1arg=yes])])
 if test x"$pgac_cv_func_gettimeofday_1arg" = xyes ; then
@@ -79,30 +79,6 @@ AH_VERBATIM(GETTIMEOFDAY_1ARG_,
 ])# PGAC_FUNC_GETTIMEOFDAY_1ARG
 
 
-# PGAC_FUNC_GETPWUID_R_5ARG
-# ---------------------------
-# Check if getpwuid_r() takes a fifth argument (later POSIX standard, not draft version)
-# If so, define GETPWUID_R_5ARG
-AC_DEFUN([PGAC_FUNC_GETPWUID_R_5ARG],
-[AC_CACHE_CHECK(whether getpwuid_r takes a fifth argument,
-pgac_cv_func_getpwuid_r_5arg,
-[AC_TRY_COMPILE([#include <sys/types.h>
-#include <pwd.h>],
-[uid_t uid;
-struct passwd *space;
-char *buf;
-size_t bufsize;
-struct passwd **result;
-getpwuid_r(uid, space, buf, bufsize, result);],
-[pgac_cv_func_getpwuid_r_5arg=yes],
-[pgac_cv_func_getpwuid_r_5arg=no])])
-if test x"$pgac_cv_func_getpwuid_r_5arg" = xyes ; then
-  AC_DEFINE(GETPWUID_R_5ARG, 1,
-            [Define to 1 if getpwuid_r() takes a 5th argument.])
-fi
-])# PGAC_FUNC_GETPWUID_R_5ARG
-
-
 # PGAC_FUNC_STRERROR_R_INT
 # ---------------------------
 # Check if strerror_r() returns an int (SUSv3) rather than a char * (GNU libc)
@@ -110,13 +86,13 @@ fi
 AC_DEFUN([PGAC_FUNC_STRERROR_R_INT],
 [AC_CACHE_CHECK(whether strerror_r returns int,
 pgac_cv_func_strerror_r_int,
-[AC_TRY_COMPILE([#include <string.h>],
+[AC_COMPILE_IFELSE([AC_LANG_PROGRAM([#include <string.h>],
 [#ifndef _AIX
 int strerror_r(int, char *, size_t);
 #else
 /* Older AIX has 'int' for the third argument so we don't test the args. */
 int strerror_r();
-#endif],
+#endif])],
 [pgac_cv_func_strerror_r_int=yes],
 [pgac_cv_func_strerror_r_int=no])])
 if test x"$pgac_cv_func_strerror_r_int" = xyes ; then
@@ -194,49 +170,22 @@ AC_DEFUN([PGAC_STRUCT_ADDRINFO],
 ])])# PGAC_STRUCT_ADDRINFO
 
 
-# PGAC_FUNC_POSIX_SIGNALS
-# -----------------------
-# Check to see if the machine has the POSIX signal interface. Define
-# HAVE_POSIX_SIGNALS if so. Also set the output variable HAVE_POSIX_SIGNALS
-# to yes or no.
-#
-# Note that this test only compiles a test program, it doesn't check
-# whether the routines actually work. If that becomes a problem, make
-# a fancier check.
-AC_DEFUN([PGAC_FUNC_POSIX_SIGNALS],
-[AC_CACHE_CHECK(for POSIX signal interface, pgac_cv_func_posix_signals,
-[AC_TRY_LINK([#include <signal.h>
-],
-[struct sigaction act, oact;
-sigemptyset(&act.sa_mask);
-act.sa_flags = SA_RESTART;
-sigaction(0, &act, &oact);],
-[pgac_cv_func_posix_signals=yes],
-[pgac_cv_func_posix_signals=no])])
-if test x"$pgac_cv_func_posix_signals" = xyes ; then
-  AC_DEFINE(HAVE_POSIX_SIGNALS, 1,
-            [Define to 1 if you have the POSIX signal interface.])
-fi
-HAVE_POSIX_SIGNALS=$pgac_cv_func_posix_signals
-AC_SUBST(HAVE_POSIX_SIGNALS)])# PGAC_FUNC_POSIX_SIGNALS
-
-
-# PGAC_FUNC_SNPRINTF_LONG_LONG_INT_FORMAT
+# PGAC_FUNC_SNPRINTF_LONG_LONG_INT_MODIFIER
 # ---------------------------------------
-# Determine which format snprintf uses for long long int.  We handle
-# %lld, %qd, %I64d.  The result is in shell variable
-# LONG_LONG_INT_FORMAT.
+# Determine which length modifier snprintf uses for long long int.  We
+# handle ll, q, and I64.  The result is in shell variable
+# LONG_LONG_INT_MODIFIER.
 #
 # MinGW uses '%I64d', though gcc throws an warning with -Wall,
 # while '%lld' doesn't generate a warning, but doesn't work.
 #
-AC_DEFUN([PGAC_FUNC_SNPRINTF_LONG_LONG_INT_FORMAT],
-[AC_MSG_CHECKING([snprintf format for long long int])
-AC_CACHE_VAL(pgac_cv_snprintf_long_long_int_format,
-[for pgac_format in '%lld' '%qd' '%I64d'; do
-AC_TRY_RUN([#include <stdio.h>
+AC_DEFUN([PGAC_FUNC_SNPRINTF_LONG_LONG_INT_MODIFIER],
+[AC_MSG_CHECKING([snprintf length modifier for long long int])
+AC_CACHE_VAL(pgac_cv_snprintf_long_long_int_modifier,
+[for pgac_modifier in 'll' 'q' 'I64'; do
+AC_RUN_IFELSE([AC_LANG_SOURCE([[#include <stdio.h>
 typedef long long int ac_int64;
-#define INT64_FORMAT "$pgac_format"
+#define INT64_FORMAT "%${pgac_modifier}d"
 
 ac_int64 a = 20000001;
 ac_int64 b = 40000005;
@@ -257,20 +206,20 @@ int does_int64_snprintf_work()
 }
 main() {
   exit(! does_int64_snprintf_work());
-}],
-[pgac_cv_snprintf_long_long_int_format=$pgac_format; break],
+}]])],
+[pgac_cv_snprintf_long_long_int_modifier=$pgac_modifier; break],
 [],
-[pgac_cv_snprintf_long_long_int_format=cross; break])
+[pgac_cv_snprintf_long_long_int_modifier=cross; break])
 done])dnl AC_CACHE_VAL
 
-LONG_LONG_INT_FORMAT=''
+LONG_LONG_INT_MODIFIER=''
 
-case $pgac_cv_snprintf_long_long_int_format in
+case $pgac_cv_snprintf_long_long_int_modifier in
   cross) AC_MSG_RESULT([cannot test (not on host machine)]);;
-  ?*)    AC_MSG_RESULT([$pgac_cv_snprintf_long_long_int_format])
-         LONG_LONG_INT_FORMAT=$pgac_cv_snprintf_long_long_int_format;;
+  ?*)    AC_MSG_RESULT([$pgac_cv_snprintf_long_long_int_modifier])
+         LONG_LONG_INT_MODIFIER=$pgac_cv_snprintf_long_long_int_modifier;;
   *)     AC_MSG_RESULT(none);;
-esac])# PGAC_FUNC_SNPRINTF_LONG_LONG_INT_FORMAT
+esac])# PGAC_FUNC_SNPRINTF_LONG_LONG_INT_MODIFIER
 
 
 # PGAC_FUNC_SNPRINTF_ARG_CONTROL
@@ -283,7 +232,7 @@ esac])# PGAC_FUNC_SNPRINTF_LONG_LONG_INT_FORMAT
 AC_DEFUN([PGAC_FUNC_SNPRINTF_ARG_CONTROL],
 [AC_MSG_CHECKING([whether snprintf supports argument control])
 AC_CACHE_VAL(pgac_cv_snprintf_arg_control,
-[AC_TRY_RUN([#include <stdio.h>
+[AC_RUN_IFELSE([AC_LANG_SOURCE([[#include <stdio.h>
 #include <string.h>
 
 int main()
@@ -295,7 +244,7 @@ int main()
   if (strcmp(buf, "4 3") != 0)
     return 1;
   return 0;
-}],
+}]])],
 [pgac_cv_snprintf_arg_control=yes],
 [pgac_cv_snprintf_arg_control=no],
 [pgac_cv_snprintf_arg_control=cross])
@@ -312,7 +261,7 @@ AC_MSG_RESULT([$pgac_cv_snprintf_arg_control])
 AC_DEFUN([PGAC_FUNC_SNPRINTF_SIZE_T_SUPPORT],
 [AC_MSG_CHECKING([whether snprintf supports the %z modifier])
 AC_CACHE_VAL(pgac_cv_snprintf_size_t_support,
-[AC_TRY_RUN([#include <stdio.h>
+[AC_RUN_IFELSE([AC_LANG_SOURCE([[#include <stdio.h>
 #include <string.h>
 
 int main()
@@ -327,11 +276,12 @@ int main()
    */
   bufz[0] = '\0';  /* in case snprintf fails to emit anything */
   snprintf(bufz, sizeof(bufz), "%zu", ~((size_t) 0));
-  snprintf(buf64, sizeof(buf64), UINT64_FORMAT, (PG_INT64_TYPE) ~((size_t) 0));
+  snprintf(buf64, sizeof(buf64), "%" INT64_MODIFIER "u",
+    (unsigned PG_INT64_TYPE) ~((size_t) 0));
   if (strcmp(bufz, buf64) != 0)
     return 1;
   return 0;
-}],
+}]])],
 [pgac_cv_snprintf_size_t_support=yes],
 [pgac_cv_snprintf_size_t_support=no],
 [pgac_cv_snprintf_size_t_support=cross])

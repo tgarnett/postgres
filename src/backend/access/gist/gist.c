@@ -4,7 +4,7 @@
  *	  interface routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,6 +16,7 @@
 
 #include "access/genam.h"
 #include "access/gist_private.h"
+#include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "catalog/pg_collation.h"
 #include "miscadmin.h"
@@ -35,6 +36,7 @@ static bool gistinserttuples(GISTInsertState *state, GISTInsertStack *stack,
 				 bool unlockbuf, bool unlockleftchild);
 static void gistfinishsplit(GISTInsertState *state, GISTInsertStack *stack,
 				GISTSTATE *giststate, List *splitinfo, bool releasebuf);
+static void gistvacuumpage(Relation rel, Page page, Buffer buffer);
 
 
 #define ROTATEDIST(d) do { \
@@ -208,6 +210,17 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 	 * because the tuple vector passed to gistSplit won't include this tuple.
 	 */
 	is_split = gistnospace(page, itup, ntup, oldoffnum, freespace);
+
+	/*
+	 * If leaf page is full, try at first to delete dead tuples. And then
+	 * check again.
+	 */
+	if (is_split && GistPageIsLeaf(page) && GistPageHasGarbage(page))
+	{
+		gistvacuumpage(rel, page, buffer);
+		is_split = gistnospace(page, itup, ntup, oldoffnum, freespace);
+	}
+
 	if (is_split)
 	{
 		/* no space for insertion */
@@ -394,6 +407,14 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 			GistPageSetNSN(ptr->page, oldnsn);
 		}
 
+		/*
+		 * gistXLogSplit() needs to WAL log a lot of pages, prepare WAL
+		 * insertion for that. NB: The number of pages and data segments
+		 * specified here must match the calculations in gistXLogSplit()!
+		 */
+		if (RelationNeedsWAL(rel))
+			XLogEnsureRecordSpace(npage, 1 + npage * 2);
+
 		START_CRIT_SECTION();
 
 		/*
@@ -445,6 +466,11 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		 */
 		START_CRIT_SECTION();
 
+		/*
+		 * While we delete only one tuple at once we could mix calls
+		 * PageIndexTupleDelete() here and PageIndexMultiDelete() in
+		 * gistRedoPageUpdateRecord()
+		 */
 		if (OffsetNumberIsValid(oldoffnum))
 			PageIndexTupleDelete(page, oldoffnum);
 		gistfillbuffer(page, itup, ntup, InvalidOffsetNumber);
@@ -1264,6 +1290,23 @@ gistSplit(Relation r,
 	int			i;
 	SplitedPageLayout *res = NULL;
 
+	/* this should never recurse very deeply, but better safe than sorry */
+	check_stack_depth();
+
+	/* there's no point in splitting an empty page */
+	Assert(len > 0);
+
+	/*
+	 * If a single tuple doesn't fit on a page, no amount of splitting will
+	 * help.
+	 */
+	if (len == 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
+				   IndexTupleSize(itup[0]), GiSTPageSize,
+				   RelationGetRelationName(r))));
+
 	memset(v.spl_lisnull, TRUE, sizeof(bool) * giststate->tupdesc->natts);
 	memset(v.spl_risnull, TRUE, sizeof(bool) * giststate->tupdesc->natts);
 	gistSplitByKey(r, page, itup, len, giststate, &v, 0);
@@ -1378,6 +1421,14 @@ initGISTstate(Relation index)
 		else
 			giststate->distanceFn[i].fn_oid = InvalidOid;
 
+		/* opclasses are not required to provide a Fetch method */
+		if (OidIsValid(index_getprocid(index, i + 1, GIST_FETCH_PROC)))
+			fmgr_info_copy(&(giststate->fetchFn[i]),
+						   index_getprocinfo(index, i + 1, GIST_FETCH_PROC),
+						   scanCxt);
+		else
+			giststate->fetchFn[i].fn_oid = InvalidOid;
+
 		/*
 		 * If the index column has a specified collation, we should honor that
 		 * while doing comparisons.  However, we may have a collatable storage
@@ -1405,4 +1456,74 @@ freeGISTstate(GISTSTATE *giststate)
 {
 	/* It's sufficient to delete the scanCxt */
 	MemoryContextDelete(giststate->scanCxt);
+}
+
+/*
+ * gistvacuumpage() -- try to remove LP_DEAD items from the given page.
+ * Function assumes that buffer is exclusively locked.
+ */
+static void
+gistvacuumpage(Relation rel, Page page, Buffer buffer)
+{
+	OffsetNumber deletable[MaxIndexTuplesPerPage];
+	int			 ndeletable = 0;
+	OffsetNumber offnum, maxoff;
+
+	Assert(GistPageIsLeaf(page));
+
+	/*
+	 * Scan over all items to see which ones need to be deleted according to
+	 * LP_DEAD flags.
+	 */
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (offnum = FirstOffsetNumber;
+		 offnum <= maxoff;
+		 offnum = OffsetNumberNext(offnum))
+	{
+		ItemId		itemId = PageGetItemId(page, offnum);
+
+		if (ItemIdIsDead(itemId))
+			deletable[ndeletable++] = offnum;
+	}
+
+	if (ndeletable > 0)
+	{
+		START_CRIT_SECTION();
+
+		PageIndexMultiDelete(page, deletable, ndeletable);
+
+		/*
+		 * Mark the page as not containing any LP_DEAD items.  This is not
+		 * certainly true (there might be some that have recently been marked,
+		 * but weren't included in our target-item list), but it will almost
+		 * always be true and it doesn't seem worth an additional page scan to
+		 * check it. Remember that F_HAS_GARBAGE is only a hint anyway.
+		 */
+		GistClearPageHasGarbage(page);
+
+		MarkBufferDirty(buffer);
+
+		/* XLOG stuff */
+		if (RelationNeedsWAL(rel))
+		{
+			XLogRecPtr	recptr;
+
+			recptr = gistXLogUpdate(rel->rd_node, buffer,
+									deletable, ndeletable,
+									NULL, 0, InvalidBuffer);
+
+			PageSetLSN(page, recptr);
+		}
+		else
+			PageSetLSN(page, gistGetFakeLSN(rel));
+
+		END_CRIT_SECTION();
+	}
+
+	/*
+	 * Note: if we didn't find any LP_DEAD items, then the page's
+	 * F_HAS_GARBAGE hint bit is falsely set.  We do not bother expending a
+	 * separate write to clear it, however.  We will clear it when we split
+	 * the page.
+	 */
 }

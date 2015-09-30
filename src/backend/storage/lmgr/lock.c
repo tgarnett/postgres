@@ -3,7 +3,7 @@
  * lock.c
  *	  POSTGRES primary lock mechanism
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,6 +35,7 @@
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
+#include "access/xlog.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
@@ -63,41 +64,41 @@ static const LOCKMASK LockConflicts[] = {
 	0,
 
 	/* AccessShareLock */
-	(1 << AccessExclusiveLock),
+	LOCKBIT_ON(AccessExclusiveLock),
 
 	/* RowShareLock */
-	(1 << ExclusiveLock) | (1 << AccessExclusiveLock),
+	LOCKBIT_ON(ExclusiveLock) | LOCKBIT_ON(AccessExclusiveLock),
 
 	/* RowExclusiveLock */
-	(1 << ShareLock) | (1 << ShareRowExclusiveLock) |
-	(1 << ExclusiveLock) | (1 << AccessExclusiveLock),
+	LOCKBIT_ON(ShareLock) | LOCKBIT_ON(ShareRowExclusiveLock) |
+	LOCKBIT_ON(ExclusiveLock) | LOCKBIT_ON(AccessExclusiveLock),
 
 	/* ShareUpdateExclusiveLock */
-	(1 << ShareUpdateExclusiveLock) |
-	(1 << ShareLock) | (1 << ShareRowExclusiveLock) |
-	(1 << ExclusiveLock) | (1 << AccessExclusiveLock),
+	LOCKBIT_ON(ShareUpdateExclusiveLock) |
+	LOCKBIT_ON(ShareLock) | LOCKBIT_ON(ShareRowExclusiveLock) |
+	LOCKBIT_ON(ExclusiveLock) | LOCKBIT_ON(AccessExclusiveLock),
 
 	/* ShareLock */
-	(1 << RowExclusiveLock) | (1 << ShareUpdateExclusiveLock) |
-	(1 << ShareRowExclusiveLock) |
-	(1 << ExclusiveLock) | (1 << AccessExclusiveLock),
+	LOCKBIT_ON(RowExclusiveLock) | LOCKBIT_ON(ShareUpdateExclusiveLock) |
+	LOCKBIT_ON(ShareRowExclusiveLock) |
+	LOCKBIT_ON(ExclusiveLock) | LOCKBIT_ON(AccessExclusiveLock),
 
 	/* ShareRowExclusiveLock */
-	(1 << RowExclusiveLock) | (1 << ShareUpdateExclusiveLock) |
-	(1 << ShareLock) | (1 << ShareRowExclusiveLock) |
-	(1 << ExclusiveLock) | (1 << AccessExclusiveLock),
+	LOCKBIT_ON(RowExclusiveLock) | LOCKBIT_ON(ShareUpdateExclusiveLock) |
+	LOCKBIT_ON(ShareLock) | LOCKBIT_ON(ShareRowExclusiveLock) |
+	LOCKBIT_ON(ExclusiveLock) | LOCKBIT_ON(AccessExclusiveLock),
 
 	/* ExclusiveLock */
-	(1 << RowShareLock) |
-	(1 << RowExclusiveLock) | (1 << ShareUpdateExclusiveLock) |
-	(1 << ShareLock) | (1 << ShareRowExclusiveLock) |
-	(1 << ExclusiveLock) | (1 << AccessExclusiveLock),
+	LOCKBIT_ON(RowShareLock) |
+	LOCKBIT_ON(RowExclusiveLock) | LOCKBIT_ON(ShareUpdateExclusiveLock) |
+	LOCKBIT_ON(ShareLock) | LOCKBIT_ON(ShareRowExclusiveLock) |
+	LOCKBIT_ON(ExclusiveLock) | LOCKBIT_ON(AccessExclusiveLock),
 
 	/* AccessExclusiveLock */
-	(1 << AccessShareLock) | (1 << RowShareLock) |
-	(1 << RowExclusiveLock) | (1 << ShareUpdateExclusiveLock) |
-	(1 << ShareLock) | (1 << ShareRowExclusiveLock) |
-	(1 << ExclusiveLock) | (1 << AccessExclusiveLock)
+	LOCKBIT_ON(AccessShareLock) | LOCKBIT_ON(RowShareLock) |
+	LOCKBIT_ON(RowExclusiveLock) | LOCKBIT_ON(ShareUpdateExclusiveLock) |
+	LOCKBIT_ON(ShareLock) | LOCKBIT_ON(ShareRowExclusiveLock) |
+	LOCKBIT_ON(ExclusiveLock) | LOCKBIT_ON(AccessExclusiveLock)
 
 };
 
@@ -372,7 +373,6 @@ void
 InitLocks(void)
 {
 	HASHCTL		info;
-	int			hash_flags;
 	long		init_table_size,
 				max_table_size;
 	bool		found;
@@ -391,15 +391,13 @@ InitLocks(void)
 	MemSet(&info, 0, sizeof(info));
 	info.keysize = sizeof(LOCKTAG);
 	info.entrysize = sizeof(LOCK);
-	info.hash = tag_hash;
 	info.num_partitions = NUM_LOCK_PARTITIONS;
-	hash_flags = (HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
 
 	LockMethodLockHash = ShmemInitHash("LOCK hash",
 									   init_table_size,
 									   max_table_size,
 									   &info,
-									   hash_flags);
+									HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
 
 	/* Assume an average of 2 holders per lock */
 	max_table_size *= 2;
@@ -413,13 +411,12 @@ InitLocks(void)
 	info.entrysize = sizeof(PROCLOCK);
 	info.hash = proclock_hash;
 	info.num_partitions = NUM_LOCK_PARTITIONS;
-	hash_flags = (HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
 
 	LockMethodProcLockHash = ShmemInitHash("PROCLOCK hash",
 										   init_table_size,
 										   max_table_size,
 										   &info,
-										   hash_flags);
+								 HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
 
 	/*
 	 * Allocate fast-path structures.
@@ -444,13 +441,11 @@ InitLocks(void)
 
 	info.keysize = sizeof(LOCALLOCKTAG);
 	info.entrysize = sizeof(LOCALLOCK);
-	info.hash = tag_hash;
-	hash_flags = (HASH_ELEM | HASH_FUNCTION);
 
 	LockMethodLocalHash = hash_create("LOCALLOCK hash",
 									  16,
 									  &info,
-									  hash_flags);
+									  HASH_ELEM | HASH_BLOBS);
 }
 
 
@@ -758,7 +753,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		locallock->numLockOwners = 0;
 		locallock->maxLockOwners = 8;
 		locallock->holdsStrongLockCount = FALSE;
-		locallock->lockOwners = NULL;
+		locallock->lockOwners = NULL;	/* in case next line fails */
 		locallock->lockOwners = (LOCALLOCKOWNER *)
 			MemoryContextAlloc(TopMemoryContext,
 						  locallock->maxLockOwners * sizeof(LOCALLOCKOWNER));
@@ -1227,7 +1222,9 @@ RemoveLocalLock(LOCALLOCK *locallock)
 		if (locallock->lockOwners[i].owner != NULL)
 			ResourceOwnerForgetLock(locallock->lockOwners[i].owner, locallock);
 	}
-	pfree(locallock->lockOwners);
+	locallock->numLockOwners = 0;
+	if (locallock->lockOwners != NULL)
+		pfree(locallock->lockOwners);
 	locallock->lockOwners = NULL;
 
 	if (locallock->holdsStrongLockCount)
@@ -2809,6 +2806,8 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode)
 		 * on this lockable object.
 		 */
 		LWLockRelease(partitionLock);
+		vxids[count].backendId = InvalidBackendId;
+		vxids[count].localTransactionId = InvalidLocalTransactionId;
 		return vxids;
 	}
 
@@ -2862,6 +2861,8 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode)
 	if (count > MaxBackends)	/* should never happen */
 		elog(PANIC, "too many conflicting locks found");
 
+	vxids[count].backendId = InvalidBackendId;
+	vxids[count].localTransactionId = InvalidLocalTransactionId;
 	return vxids;
 }
 

@@ -4,7 +4,7 @@
  *	  Lightweight lock manager
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/lwlock.h
@@ -14,7 +14,13 @@
 #ifndef LWLOCK_H
 #define LWLOCK_H
 
+#ifdef FRONTEND
+#error "lwlock.h may not be included from frontend code"
+#endif
+
+#include "lib/ilist.h"
 #include "storage/s_lock.h"
+#include "port/atomics.h"
 
 struct PGPROC;
 
@@ -46,13 +52,16 @@ typedef struct LWLockTranche
 typedef struct LWLock
 {
 	slock_t		mutex;			/* Protects LWLock and queue of PGPROCs */
-	bool		releaseOK;		/* T if ok to release waiters */
-	char		exclusive;		/* # of exclusive holders (0 or 1) */
-	int			shared;			/* # of shared holders (0..MaxBackends) */
-	int			tranche;		/* tranche ID */
-	struct PGPROC *head;		/* head of list of waiting PGPROCs */
-	struct PGPROC *tail;		/* tail of list of waiting PGPROCs */
-	/* tail is undefined when head is NULL */
+	uint16		tranche;		/* tranche ID */
+
+	pg_atomic_uint32 state;		/* state of exclusive/nonexclusive lockers */
+#ifdef LOCK_DEBUG
+	pg_atomic_uint32 nwaiters;	/* number of waiters */
+#endif
+	dlist_head	waiters;		/* list of waiting PGPROCs */
+#ifdef LOCK_DEBUG
+	struct PGPROC *owner;		/* last exclusive owner of the lock */
+#endif
 } LWLock;
 
 /*
@@ -67,11 +76,11 @@ typedef struct LWLock
  * (Of course, we have to also ensure that the array start address is suitably
  * aligned.)
  *
- * Even on a 32-bit platform, an lwlock will be more than 16 bytes, because
- * it contains 2 integers and 2 pointers, plus other stuff.  It should fit
- * into 32 bytes, though, unless slock_t is really big.  On a 64-bit platform,
- * it should fit into 32 bytes unless slock_t is larger than 4 bytes.  We
- * allow for that just in case.
+ * On a 32-bit platforms a LWLock will these days fit into 16 bytes, but since
+ * that didn't use to be the case and cramming more lwlocks into a cacheline
+ * might be detrimental performancewise we still use 32 byte alignment
+ * there. So, both on 32 and 64 bit platforms, it should fit into 32 bytes
+ * unless slock_t is really big.  We allow for that just in case.
  */
 #define LWLOCK_PADDED_SIZE	(sizeof(LWLock) <= 32 ? 32 : 64)
 
@@ -81,53 +90,10 @@ typedef union LWLockPadded
 	char		pad[LWLOCK_PADDED_SIZE];
 } LWLockPadded;
 extern PGDLLIMPORT LWLockPadded *MainLWLockArray;
+extern char *MainLWLockNames[];
 
-/*
- * Some commonly-used locks have predefined positions within MainLWLockArray;
- * defining macros here makes it much easier to keep track of these.  If you
- * add a lock, add it to the end to avoid renumbering the existing locks;
- * if you remove a lock, consider leaving a gap in the numbering sequence for
- * the benefit of DTrace and other external debugging scripts.
- */
-#define BufFreelistLock				(&MainLWLockArray[0].lock)
-#define ShmemIndexLock				(&MainLWLockArray[1].lock)
-#define OidGenLock					(&MainLWLockArray[2].lock)
-#define XidGenLock					(&MainLWLockArray[3].lock)
-#define ProcArrayLock				(&MainLWLockArray[4].lock)
-#define SInvalReadLock				(&MainLWLockArray[5].lock)
-#define SInvalWriteLock				(&MainLWLockArray[6].lock)
-#define WALBufMappingLock			(&MainLWLockArray[7].lock)
-#define WALWriteLock				(&MainLWLockArray[8].lock)
-#define ControlFileLock				(&MainLWLockArray[9].lock)
-#define CheckpointLock				(&MainLWLockArray[10].lock)
-#define CLogControlLock				(&MainLWLockArray[11].lock)
-#define SubtransControlLock			(&MainLWLockArray[12].lock)
-#define MultiXactGenLock			(&MainLWLockArray[13].lock)
-#define MultiXactOffsetControlLock	(&MainLWLockArray[14].lock)
-#define MultiXactMemberControlLock	(&MainLWLockArray[15].lock)
-#define RelCacheInitLock			(&MainLWLockArray[16].lock)
-#define CheckpointerCommLock		(&MainLWLockArray[17].lock)
-#define TwoPhaseStateLock			(&MainLWLockArray[18].lock)
-#define TablespaceCreateLock		(&MainLWLockArray[19].lock)
-#define BtreeVacuumLock				(&MainLWLockArray[20].lock)
-#define AddinShmemInitLock			(&MainLWLockArray[21].lock)
-#define AutovacuumLock				(&MainLWLockArray[22].lock)
-#define AutovacuumScheduleLock		(&MainLWLockArray[23].lock)
-#define SyncScanLock				(&MainLWLockArray[24].lock)
-#define RelationMappingLock			(&MainLWLockArray[25].lock)
-#define AsyncCtlLock				(&MainLWLockArray[26].lock)
-#define AsyncQueueLock				(&MainLWLockArray[27].lock)
-#define SerializableXactHashLock	(&MainLWLockArray[28].lock)
-#define SerializableFinishedListLock		(&MainLWLockArray[29].lock)
-#define SerializablePredicateLockListLock	(&MainLWLockArray[30].lock)
-#define OldSerXidLock				(&MainLWLockArray[31].lock)
-#define SyncRepLock					(&MainLWLockArray[32].lock)
-#define BackgroundWorkerLock		(&MainLWLockArray[33].lock)
-#define DynamicSharedMemoryControlLock		(&MainLWLockArray[34].lock)
-#define AutoFileLock				(&MainLWLockArray[35].lock)
-#define ReplicationSlotAllocationLock	(&MainLWLockArray[36].lock)
-#define ReplicationSlotControlLock		(&MainLWLockArray[37].lock)
-#define NUM_INDIVIDUAL_LWLOCKS		38
+/* Names for fixed lwlocks */
+#include "storage/lwlocknames.h"
 
 /*
  * It's a bit odd to declare NUM_BUFFER_PARTITIONS and NUM_LOCK_PARTITIONS
@@ -136,7 +102,7 @@ extern PGDLLIMPORT LWLockPadded *MainLWLockArray;
  */
 
 /* Number of partitions of the shared buffer mapping hashtable */
-#define NUM_BUFFER_PARTITIONS  16
+#define NUM_BUFFER_PARTITIONS  128
 
 /* Number of partitions the shared lock tables are divided into */
 #define LOG2_NUM_LOCK_PARTITIONS  4
@@ -173,10 +139,10 @@ extern bool LWLockAcquire(LWLock *lock, LWLockMode mode);
 extern bool LWLockConditionalAcquire(LWLock *lock, LWLockMode mode);
 extern bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode);
 extern void LWLockRelease(LWLock *lock);
+extern void LWLockReleaseClearVar(LWLock *lock, uint64 *valptr, uint64 val);
 extern void LWLockReleaseAll(void);
 extern bool LWLockHeldByMe(LWLock *lock);
 
-extern bool LWLockAcquireWithVar(LWLock *lock, uint64 *valptr, uint64 val);
 extern bool LWLockWaitForVar(LWLock *lock, uint64 *valptr, uint64 oldval, uint64 *newval);
 extern void LWLockUpdateVar(LWLock *lock, uint64 *valptr, uint64 value);
 
@@ -207,8 +173,8 @@ extern LWLock *LWLockAssign(void);
  * registration in the main shared memory segment wouldn't work for that case.
  */
 extern int	LWLockNewTrancheId(void);
-extern void LWLockRegisterTranche(int, LWLockTranche *);
-extern void LWLockInitialize(LWLock *, int tranche_id);
+extern void LWLockRegisterTranche(int tranche_id, LWLockTranche *tranche);
+extern void LWLockInitialize(LWLock *lock, int tranche_id);
 
 /*
  * Prior to PostgreSQL 9.4, we used an enum type called LWLockId to refer

@@ -5,7 +5,7 @@
  *	Lately it's also being used by psql and bin/scripts/ ...
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_dump/dumputils.c
@@ -500,6 +500,7 @@ buildACLCommands(const char *name, const char *subname,
 				 const char *prefix, int remoteVersion,
 				 PQExpBuffer sql)
 {
+	bool		ok = true;
 	char	  **aclitems;
 	int			naclitems;
 	int			i;
@@ -570,8 +571,8 @@ buildACLCommands(const char *name, const char *subname,
 		if (!parseAclItem(aclitems[i], type, name, subname, remoteVersion,
 						  grantee, grantor, privs, privswgo))
 		{
-			free(aclitems);
-			return false;
+			ok = false;
+			break;
 		}
 
 		if (grantor->len == 0 && owner)
@@ -678,7 +679,7 @@ buildACLCommands(const char *name, const char *subname,
 
 	free(aclitems);
 
-	return true;
+	return ok;
 }
 
 /*
@@ -1215,11 +1216,11 @@ simple_string_list_append(SimpleStringList *list, const char *val)
 {
 	SimpleStringListCell *cell;
 
-	/* this calculation correctly accounts for the null trailing byte */
 	cell = (SimpleStringListCell *)
-		pg_malloc(sizeof(SimpleStringListCell) + strlen(val));
+		pg_malloc(offsetof(SimpleStringListCell, val) +strlen(val) + 1);
 
 	cell->next = NULL;
+	cell->touched = false;
 	strcpy(cell->val, val);
 
 	if (list->tail)
@@ -1237,7 +1238,23 @@ simple_string_list_member(SimpleStringList *list, const char *val)
 	for (cell = list->head; cell; cell = cell->next)
 	{
 		if (strcmp(cell->val, val) == 0)
+		{
+			cell->touched = true;
 			return true;
+		}
 	}
 	return false;
+}
+
+const char *
+simple_string_list_not_touched(SimpleStringList *list)
+{
+	SimpleStringListCell *cell;
+
+	for (cell = list->head; cell; cell = cell->next)
+	{
+		if (!cell->touched)
+			return cell->val;
+	}
+	return NULL;
 }

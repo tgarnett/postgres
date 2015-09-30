@@ -21,10 +21,16 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-CREATE SCHEMA <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">user_name</replaceable> ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
-CREATE SCHEMA AUTHORIZATION <replaceable class="parameter">user_name</replaceable> [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
-CREATE SCHEMA IF NOT EXISTS <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">user_name</replaceable> ]
-CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">user_name</replaceable>
+CREATE SCHEMA <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="PARAMETER">role_specification</replaceable> ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
+CREATE SCHEMA AUTHORIZATION <replaceable class="PARAMETER">role_specification</replaceable> [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
+CREATE SCHEMA IF NOT EXISTS <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="PARAMETER">role_specification</replaceable> ]
+CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="PARAMETER">role_specification</replaceable>
+
+<phrase>where <replaceable class="PARAMETER">role_specification</replaceable> can be:</phrase>
+
+    [ GROUP ] <replaceable class="PARAMETER">user_name</replaceable>
+  | CURRENT_USER
+  | SESSION_USER
 </synopsis>
  </refsynopsisdiv>
 
@@ -199,7 +205,7 @@ CREATE VIEW hollywood.winners AS
    all objects within it.  <productname>PostgreSQL</productname>
    allows schemas to contain objects owned by users other than the
    schema owner.  This can happen only if the schema owner grants the
-   <literal>CREATE</> privilege on his schema to someone else, or a
+   <literal>CREATE</> privilege on their schema to someone else, or a
    superuser chooses to create objects in it.
   </para>
 

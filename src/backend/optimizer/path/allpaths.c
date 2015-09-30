@@ -3,7 +3,7 @@
  * allpaths.c
  *	  Routines to find possible search paths for processing a query
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,6 +18,7 @@
 #include <math.h>
 
 #include "access/sysattr.h"
+#include "access/tsmapi.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "foreign/fdwapi.h"
@@ -54,10 +55,14 @@ typedef struct pushdown_safety_info
 bool		enable_geqo = false;	/* just in case GUC doesn't set it */
 int			geqo_threshold;
 
+/* Hook for plugins to get control in set_rel_pathlist() */
+set_rel_pathlist_hook_type set_rel_pathlist_hook = NULL;
+
 /* Hook for plugins to replace standard_join_search() */
 join_search_hook_type join_search_hook = NULL;
 
 
+static void set_base_rel_consider_startup(PlannerInfo *root);
 static void set_base_rel_sizes(PlannerInfo *root);
 static void set_base_rel_pathlists(PlannerInfo *root);
 static void set_rel_size(PlannerInfo *root, RelOptInfo *rel,
@@ -68,6 +73,10 @@ static void set_plain_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				   RangeTblEntry *rte);
 static void set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					   RangeTblEntry *rte);
+static void set_tablesample_rel_size(PlannerInfo *root, RelOptInfo *rel,
+						 RangeTblEntry *rte);
+static void set_tablesample_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
+							 RangeTblEntry *rte);
 static void set_foreign_size(PlannerInfo *root, RelOptInfo *rel,
 				 RangeTblEntry *rte);
 static void set_foreign_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -145,6 +154,9 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 		root->all_baserels = bms_add_member(root->all_baserels, brel->relid);
 	}
 
+	/* Mark base rels as to whether we care about fast-start plans */
+	set_base_rel_consider_startup(root);
+
 	/*
 	 * Generate access paths for the base rels.
 	 */
@@ -162,6 +174,49 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 	Assert(bms_equal(rel->relids, root->all_baserels));
 
 	return rel;
+}
+
+/*
+ * set_base_rel_consider_startup
+ *	  Set the consider_[param_]startup flags for each base-relation entry.
+ *
+ * For the moment, we only deal with consider_param_startup here; because the
+ * logic for consider_startup is pretty trivial and is the same for every base
+ * relation, we just let build_simple_rel() initialize that flag correctly to
+ * start with.  If that logic ever gets more complicated it would probably
+ * be better to move it here.
+ */
+static void
+set_base_rel_consider_startup(PlannerInfo *root)
+{
+	/*
+	 * Since parameterized paths can only be used on the inside of a nestloop
+	 * join plan, there is usually little value in considering fast-start
+	 * plans for them.  However, for relations that are on the RHS of a SEMI
+	 * or ANTI join, a fast-start plan can be useful because we're only going
+	 * to care about fetching one tuple anyway.
+	 *
+	 * To minimize growth of planning time, we currently restrict this to
+	 * cases where the RHS is a single base relation, not a join; there is no
+	 * provision for consider_param_startup to get set at all on joinrels.
+	 * Also we don't worry about appendrels.  costsize.c's costing rules for
+	 * nestloop semi/antijoins don't consider such cases either.
+	 */
+	ListCell   *lc;
+
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		int			varno;
+
+		if ((sjinfo->jointype == JOIN_SEMI || sjinfo->jointype == JOIN_ANTI) &&
+			bms_get_singleton_member(sjinfo->syn_righthand, &varno))
+		{
+			RelOptInfo *rel = find_base_rel(root, varno);
+
+			rel->consider_param_startup = true;
+		}
+	}
 }
 
 /*
@@ -238,7 +293,7 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		 * We proved we don't need to scan the rel via constraint exclusion,
 		 * so set up a single dummy path for it.  Here we only check this for
 		 * regular baserels; if it's an otherrel, CE was already checked in
-		 * set_append_rel_pathlist().
+		 * set_append_rel_size().
 		 *
 		 * In this case, we go ahead and set up the relation's path right away
 		 * instead of leaving it for set_rel_pathlist to do.  This is because
@@ -261,6 +316,11 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				{
 					/* Foreign table */
 					set_foreign_size(root, rel, rte);
+				}
+				else if (rte->tablesample != NULL)
+				{
+					/* Sampled relation */
+					set_tablesample_rel_size(root, rel, rte);
 				}
 				else
 				{
@@ -300,6 +360,11 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				break;
 		}
 	}
+
+	/*
+	 * We insist that all non-dummy rels have a nonzero rowcount estimate.
+	 */
+	Assert(rel->rows > 0 || IS_DUMMY_REL(rel));
 }
 
 /*
@@ -329,6 +394,11 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					/* Foreign table */
 					set_foreign_pathlist(root, rel, rte);
 				}
+				else if (rte->tablesample != NULL)
+				{
+					/* Sampled relation */
+					set_tablesample_rel_pathlist(root, rel, rte);
+				}
 				else
 				{
 					/* Plain relation */
@@ -354,6 +424,17 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				break;
 		}
 	}
+
+	/*
+	 * Allow a plugin to editorialize on the set of Paths for this base
+	 * relation.  It could add new paths (such as CustomPaths) by calling
+	 * add_path(), or delete or modify paths added by the core code.
+	 */
+	if (set_rel_pathlist_hook)
+		(*set_rel_pathlist_hook) (root, rel, rti, rte);
+
+	/* Now find the cheapest of the paths for this rel */
+	set_cheapest(rel);
 
 #ifdef OPTIMIZER_DEBUG
 	debug_print_rel(root, rel);
@@ -401,9 +482,94 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	/* Consider TID scans */
 	create_tidscan_paths(root, rel);
+}
 
-	/* Now find the cheapest of the paths for this rel */
-	set_cheapest(rel);
+/*
+ * set_tablesample_rel_size
+ *	  Set size estimates for a sampled relation
+ */
+static void
+set_tablesample_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	TableSampleClause *tsc = rte->tablesample;
+	TsmRoutine *tsm;
+	BlockNumber pages;
+	double		tuples;
+
+	/*
+	 * Test any partial indexes of rel for applicability.  We must do this
+	 * first since partial unique indexes can affect size estimates.
+	 */
+	check_partial_indexes(root, rel);
+
+	/*
+	 * Call the sampling method's estimation function to estimate the number
+	 * of pages it will read and the number of tuples it will return.  (Note:
+	 * we assume the function returns sane values.)
+	 */
+	tsm = GetTsmRoutine(tsc->tsmhandler);
+	tsm->SampleScanGetSampleSize(root, rel, tsc->args,
+								 &pages, &tuples);
+
+	/*
+	 * For the moment, because we will only consider a SampleScan path for the
+	 * rel, it's okay to just overwrite the pages and tuples estimates for the
+	 * whole relation.  If we ever consider multiple path types for sampled
+	 * rels, we'll need more complication.
+	 */
+	rel->pages = pages;
+	rel->tuples = tuples;
+
+	/* Mark rel with estimated output rows, width, etc */
+	set_baserel_size_estimates(root, rel);
+}
+
+/*
+ * set_tablesample_rel_pathlist
+ *	  Build access paths for a sampled relation
+ */
+static void
+set_tablesample_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	Relids		required_outer;
+	Path	   *path;
+
+	/*
+	 * We don't support pushing join clauses into the quals of a samplescan,
+	 * but it could still have required parameterization due to LATERAL refs
+	 * in its tlist or TABLESAMPLE arguments.
+	 */
+	required_outer = rel->lateral_relids;
+
+	/* Consider sampled scan */
+	path = create_samplescan_path(root, rel, required_outer);
+
+	/*
+	 * If the sampling method does not support repeatable scans, we must avoid
+	 * plans that would scan the rel multiple times.  Ideally, we'd simply
+	 * avoid putting the rel on the inside of a nestloop join; but adding such
+	 * a consideration to the planner seems like a great deal of complication
+	 * to support an uncommon usage of second-rate sampling methods.  Instead,
+	 * if there is a risk that the query might perform an unsafe join, just
+	 * wrap the SampleScan in a Materialize node.  We can check for joins by
+	 * counting the membership of all_baserels (note that this correctly
+	 * counts inheritance trees as single rels).  If we're inside a subquery,
+	 * we can't easily check whether a join might occur in the outer query, so
+	 * just assume one is possible.
+	 *
+	 * GetTsmRoutine is relatively expensive compared to the other tests here,
+	 * so check repeatable_across_scans last, even though that's a bit odd.
+	 */
+	if ((root->query_level > 1 ||
+		 bms_membership(root->all_baserels) != BMS_SINGLETON) &&
+	 !(GetTsmRoutine(rte->tablesample->tsmhandler)->repeatable_across_scans))
+	{
+		path = (Path *) create_material_path(rel, path);
+	}
+
+	add_path(rel, path);
+
+	/* For the moment, at least, there are no other paths to consider */
 }
 
 /*
@@ -418,6 +584,9 @@ set_foreign_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	/* Let FDW adjust the size estimates, if it can */
 	rel->fdwroutine->GetForeignRelSize(root, rel, rte->relid);
+
+	/* ... but do not let it set the rows estimate to zero */
+	rel->rows = clamp_row_est(rel->rows);
 }
 
 /*
@@ -429,9 +598,6 @@ set_foreign_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
 	/* Call the FDW's GetForeignPaths function to generate path(s) */
 	rel->fdwroutine->GetForeignPaths(root, rel, rte->relid);
-
-	/* Select cheapest path */
-	set_cheapest(rel);
 }
 
 /*
@@ -450,6 +616,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 					Index rti, RangeTblEntry *rte)
 {
 	int			parentRTindex = rti;
+	bool		has_live_children;
 	double		parent_rows;
 	double		parent_size;
 	double	   *parent_attrsizes;
@@ -470,6 +637,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 	 * Note: if you consider changing this logic, beware that child rels could
 	 * have zero rows and/or width, if they were excluded by constraints.
 	 */
+	has_live_children = false;
 	parent_rows = 0;
 	parent_size = 0;
 	nattrs = rel->max_attr - rel->min_attr + 1;
@@ -597,70 +765,80 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		if (IS_DUMMY_REL(childrel))
 			continue;
 
+		/* We have at least one live child. */
+		has_live_children = true;
+
 		/*
 		 * Accumulate size information from each live child.
 		 */
-		if (childrel->rows > 0)
+		Assert(childrel->rows > 0);
+
+		parent_rows += childrel->rows;
+		parent_size += childrel->width * childrel->rows;
+
+		/*
+		 * Accumulate per-column estimates too.  We need not do anything for
+		 * PlaceHolderVars in the parent list.  If child expression isn't a
+		 * Var, or we didn't record a width estimate for it, we have to fall
+		 * back on a datatype-based estimate.
+		 *
+		 * By construction, child's reltargetlist is 1-to-1 with parent's.
+		 */
+		forboth(parentvars, rel->reltargetlist,
+				childvars, childrel->reltargetlist)
 		{
-			parent_rows += childrel->rows;
-			parent_size += childrel->width * childrel->rows;
+			Var		   *parentvar = (Var *) lfirst(parentvars);
+			Node	   *childvar = (Node *) lfirst(childvars);
 
-			/*
-			 * Accumulate per-column estimates too.  We need not do anything
-			 * for PlaceHolderVars in the parent list.  If child expression
-			 * isn't a Var, or we didn't record a width estimate for it, we
-			 * have to fall back on a datatype-based estimate.
-			 *
-			 * By construction, child's reltargetlist is 1-to-1 with parent's.
-			 */
-			forboth(parentvars, rel->reltargetlist,
-					childvars, childrel->reltargetlist)
+			if (IsA(parentvar, Var))
 			{
-				Var		   *parentvar = (Var *) lfirst(parentvars);
-				Node	   *childvar = (Node *) lfirst(childvars);
+				int			pndx = parentvar->varattno - rel->min_attr;
+				int32		child_width = 0;
 
-				if (IsA(parentvar, Var))
+				if (IsA(childvar, Var) &&
+					((Var *) childvar)->varno == childrel->relid)
 				{
-					int			pndx = parentvar->varattno - rel->min_attr;
-					int32		child_width = 0;
+					int			cndx = ((Var *) childvar)->varattno - childrel->min_attr;
 
-					if (IsA(childvar, Var) &&
-						((Var *) childvar)->varno == childrel->relid)
-					{
-						int			cndx = ((Var *) childvar)->varattno - childrel->min_attr;
-
-						child_width = childrel->attr_widths[cndx];
-					}
-					if (child_width <= 0)
-						child_width = get_typavgwidth(exprType(childvar),
-													  exprTypmod(childvar));
-					Assert(child_width > 0);
-					parent_attrsizes[pndx] += child_width * childrel->rows;
+					child_width = childrel->attr_widths[cndx];
 				}
+				if (child_width <= 0)
+					child_width = get_typavgwidth(exprType(childvar),
+												  exprTypmod(childvar));
+				Assert(child_width > 0);
+				parent_attrsizes[pndx] += child_width * childrel->rows;
 			}
 		}
 	}
 
-	/*
-	 * Save the finished size estimates.
-	 */
-	rel->rows = parent_rows;
-	if (parent_rows > 0)
+	if (has_live_children)
 	{
+		/*
+		 * Save the finished size estimates.
+		 */
 		int			i;
 
+		Assert(parent_rows > 0);
+		rel->rows = parent_rows;
 		rel->width = rint(parent_size / parent_rows);
 		for (i = 0; i < nattrs; i++)
 			rel->attr_widths[i] = rint(parent_attrsizes[i] / parent_rows);
+
+		/*
+		 * Set "raw tuples" count equal to "rows" for the appendrel; needed
+		 * because some places assume rel->tuples is valid for any baserel.
+		 */
+		rel->tuples = parent_rows;
 	}
 	else
-		rel->width = 0;			/* attr_widths should be zero already */
-
-	/*
-	 * Set "raw tuples" count equal to "rows" for the appendrel; needed
-	 * because some places assume rel->tuples is valid for any baserel.
-	 */
-	rel->tuples = parent_rows;
+	{
+		/*
+		 * All children were excluded by constraints, so mark the whole
+		 * appendrel dummy.  We must do this in this phase so that the rel's
+		 * dummy-ness is visible when we generate paths for other rels.
+		 */
+		set_dummy_rel_pathlist(rel);
+	}
 
 	pfree(parent_attrsizes);
 }
@@ -854,9 +1032,6 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			add_path(rel, (Path *)
 					 create_append_path(rel, subpaths, required_outer));
 	}
-
-	/* Select cheapest paths */
-	set_cheapest(rel);
 }
 
 /*
@@ -1084,7 +1259,12 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
 
 	add_path(rel, (Path *) create_append_path(rel, NIL, NULL));
 
-	/* Select cheapest path (pretty easy in this case...) */
+	/*
+	 * We set the cheapest path immediately, to ensure that IS_DUMMY_REL()
+	 * will recognize the relation as dummy if anyone asks.  This is redundant
+	 * when we're called from set_rel_size(), but not when called from
+	 * elsewhere, and doing it twice is harmless anyway.
+	 */
 	set_cheapest(rel);
 }
 
@@ -1161,7 +1341,7 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	/*
 	 * If the subquery has the "security_barrier" flag, it means the subquery
-	 * originated from a view that must enforce row-level security.  Then we
+	 * originated from a view that must enforce row level security.  Then we
 	 * must not push down quals that contain leaky functions.  (Ideally this
 	 * would be checked inside subquery_is_pushdown_safe, but since we don't
 	 * currently pass the RTE to that function, we must do it here.)
@@ -1231,6 +1411,7 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	if (parse->hasAggs ||
 		parse->groupClause ||
+		parse->groupingSets ||
 		parse->havingQual ||
 		parse->distinctClause ||
 		parse->sortClause ||
@@ -1272,9 +1453,6 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	/* Generate appropriate path */
 	add_path(rel, create_subqueryscan_path(root, rel, pathkeys, required_outer));
-
-	/* Select cheapest path (pretty easy in this case...) */
-	set_cheapest(rel);
 }
 
 /*
@@ -1343,9 +1521,6 @@ set_function_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* Generate appropriate path */
 	add_path(rel, create_functionscan_path(root, rel,
 										   pathkeys, required_outer));
-
-	/* Select cheapest path (pretty easy in this case...) */
-	set_cheapest(rel);
 }
 
 /*
@@ -1366,9 +1541,6 @@ set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	/* Generate appropriate path */
 	add_path(rel, create_valuesscan_path(root, rel, required_outer));
-
-	/* Select cheapest path (pretty easy in this case...) */
-	set_cheapest(rel);
 }
 
 /*
@@ -1435,9 +1607,6 @@ set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	/* Generate appropriate path */
 	add_path(rel, create_ctescan_path(root, rel, required_outer));
-
-	/* Select cheapest path (pretty easy in this case...) */
-	set_cheapest(rel);
 }
 
 /*
@@ -1488,9 +1657,6 @@ set_worktable_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	/* Generate appropriate path */
 	add_path(rel, create_worktablescan_path(root, rel, required_outer));
-
-	/* Select cheapest path (pretty easy in this case...) */
-	set_cheapest(rel);
 }
 
 /*
@@ -1987,7 +2153,9 @@ targetIsInAllPartitionLists(TargetEntry *tle, Query *query)
  * 2. If unsafeVolatile is set, the qual must not contain any volatile
  * functions.
  *
- * 3. If unsafeLeaky is set, the qual must not contain any leaky functions.
+ * 3. If unsafeLeaky is set, the qual must not contain any leaky functions
+ * that are passed Var nodes, and therefore might reveal values from the
+ * subquery as side effects.
  *
  * 4. The qual must not refer to the whole-row output of the subquery
  * (since there is no easy way to name that within the subquery itself).
@@ -2014,7 +2182,7 @@ qual_is_pushdown_safe(Query *subquery, Index rti, Node *qual,
 
 	/* Refuse leaky quals if told to (point 3) */
 	if (safetyInfo->unsafeLeaky &&
-		contain_leaky_functions(qual))
+		contain_leaked_vars(qual))
 		return false;
 
 	/*
@@ -2083,6 +2251,46 @@ subquery_push_qual(Query *subquery, RangeTblEntry *rte, Index rti, Node *qual)
 		recurse_push_qual(subquery->setOperations, subquery,
 						  rte, rti, qual);
 	}
+	else if (IsA(qual, CurrentOfExpr))
+	{
+		/*
+		 * This is possible when a WHERE CURRENT OF expression is applied to a
+		 * table with row-level security.  In that case, the subquery should
+		 * contain precisely one rtable entry for the table, and we can safely
+		 * push the expression down into the subquery.  This will cause a TID
+		 * scan subquery plan to be generated allowing the target relation to
+		 * be updated.
+		 *
+		 * Someday we might also be able to use a WHERE CURRENT OF expression
+		 * on a view, but currently the rewriter prevents that, so we should
+		 * never see any other case here, but generate sane error messages in
+		 * case it does somehow happen.
+		 */
+		if (subquery->rtable == NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("WHERE CURRENT OF is not supported on a view with no underlying relation")));
+
+		if (list_length(subquery->rtable) > 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("WHERE CURRENT OF is not supported on a view with more than one underlying relation")));
+
+		if (subquery->hasAggs || subquery->groupClause || subquery->groupingSets || subquery->havingQual)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("WHERE CURRENT OF is not supported on a view with grouping or aggregation")));
+
+		/*
+		 * Adjust the CURRENT OF expression to refer to the underlying table
+		 * in the subquery, and attach it to the subquery's WHERE clause.
+		 */
+		qual = copyObject(qual);
+		((CurrentOfExpr *) qual)->cvarno = 1;
+
+		subquery->jointree->quals =
+			make_and_qual(subquery->jointree->quals, qual);
+	}
 	else
 	{
 		/*
@@ -2104,7 +2312,7 @@ subquery_push_qual(Query *subquery, RangeTblEntry *rte, Index rti, Node *qual)
 		 * subquery uses grouping or aggregation, put it in HAVING (since the
 		 * qual really refers to the group-result rows).
 		 */
-		if (subquery->hasAggs || subquery->groupClause || subquery->havingQual)
+		if (subquery->hasAggs || subquery->groupClause || subquery->groupingSets || subquery->havingQual)
 			subquery->havingQual = make_and_qual(subquery->havingQual, qual);
 		else
 			subquery->jointree->quals =
@@ -2277,19 +2485,17 @@ remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel)
 static void
 print_relids(Relids relids)
 {
-	Relids		tmprelids;
 	int			x;
 	bool		first = true;
 
-	tmprelids = bms_copy(relids);
-	while ((x = bms_first_member(tmprelids)) >= 0)
+	x = -1;
+	while ((x = bms_next_member(relids, x)) >= 0)
 	{
 		if (!first)
 			printf(" ");
 		printf("%d", x);
 		first = false;
 	}
-	bms_free(tmprelids);
 }
 
 static void
@@ -2318,7 +2524,33 @@ print_path(PlannerInfo *root, Path *path, int indent)
 	switch (nodeTag(path))
 	{
 		case T_Path:
-			ptype = "SeqScan";
+			switch (path->pathtype)
+			{
+				case T_SeqScan:
+					ptype = "SeqScan";
+					break;
+				case T_SampleScan:
+					ptype = "SampleScan";
+					break;
+				case T_SubqueryScan:
+					ptype = "SubqueryScan";
+					break;
+				case T_FunctionScan:
+					ptype = "FunctionScan";
+					break;
+				case T_ValuesScan:
+					ptype = "ValuesScan";
+					break;
+				case T_CteScan:
+					ptype = "CteScan";
+					break;
+				case T_WorkTableScan:
+					ptype = "WorkTableScan";
+					break;
+				default:
+					ptype = "???Path";
+					break;
+			}
 			break;
 		case T_IndexPath:
 			ptype = "IdxScan";

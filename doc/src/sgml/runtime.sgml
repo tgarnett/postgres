@@ -49,7 +49,7 @@
   <para>
    Before you can do anything, you must initialize a database storage
    area on disk. We call this a <firstterm>database cluster</firstterm>.
-   (<acronym>SQL</acronym> uses the term catalog cluster.) A
+   (The <acronym>SQL</acronym> standard uses the term catalog cluster.) A
    database cluster is a collection of databases that is managed by a
    single instance of a running database server. After initialization, a
    database cluster will contain a database named <literal>postgres</literal>,
@@ -65,7 +65,7 @@
   </para>
 
   <para>
-   In file system terms, a database cluster will be a single directory
+   In file system terms, a database cluster is a single directory
    under which all data will be stored. We call this the <firstterm>data
    directory</firstterm> or <firstterm>data area</firstterm>. It is
    completely up to you where you choose to store your data.  There is no
@@ -109,15 +109,18 @@
 
   <para>
    <command>initdb</command> will attempt to create the directory you
-   specify if it does not already exist. It is likely that it will not
-   have the permission to do so (if you followed our advice and created
-   an unprivileged account). In that case you should create the
-   directory yourself (as root) and change the owner to be the
-   <productname>PostgreSQL</productname> user. Here is how this might
-   be done:
+   specify if it does not already exist.  Of course, this will fail if
+   <command>initdb</command> does not have permissions to write in the
+   parent directory.  It's generally recommendable that the
+   <productname>PostgreSQL</productname> user own not just the data
+   directory but its parent directory as well, so that this should not
+   be a problem.  If the desired parent directory doesn't exist either,
+   you will need to create it first, using root privileges if the
+   grandparent directory isn't writable.  So the process might look
+   like this:
 <screen>
-root# <userinput>mkdir /usr/local/pgsql/data</userinput>
-root# <userinput>chown postgres /usr/local/pgsql/data</userinput>
+root# <userinput>mkdir /usr/local/pgsql</userinput>
+root# <userinput>chown postgres /usr/local/pgsql</userinput>
 root# <userinput>su postgres</userinput>
 postgres$ <userinput>initdb -D /usr/local/pgsql/data</userinput>
 </screen>
@@ -125,7 +128,9 @@ postgres$ <userinput>initdb -D /usr/local/pgsql/data</userinput>
 
   <para>
    <command>initdb</command> will refuse to run if the data directory
-   looks like it has already been initialized.</para>
+   exists and already contains files; this is to prevent accidentally
+   overwriting an existing installation.
+  </para>
 
   <para>
    Because the data directory contains all the data stored in the
@@ -178,8 +183,30 @@ postgres$ <userinput>initdb -D /usr/local/pgsql/data</userinput>
    locale setting.  For details see <xref linkend="multibyte">.
   </para>
 
+  <sect2 id="creating-cluster-mount-points">
+   <title>Use of Secondary File Systems</title>
+
+   <indexterm zone="creating-cluster-mount-points">
+    <primary>file system mount points</primary>
+   </indexterm>
+
+   <para>
+    Many installations create their database clusters on file systems
+    (volumes) other than the machine's <quote>root</> volume.  If you
+    choose to do this, it is not advisable to try to use the secondary
+    volume's topmost directory (mount point) as the data directory.
+    Best practice is to create a directory within the mount-point
+    directory that is owned by the <productname>PostgreSQL</productname>
+    user, and then create the data directory within that.  This avoids
+    permissions problems, particularly for operations such
+    as <application>pg_upgrade</>, and it also ensures clean failures if
+    the secondary volume is taken offline.
+   </para>
+
+  </sect2>
+
   <sect2 id="creating-cluster-nfs">
-   <title>Network File Systems</title>
+   <title>Use of Network File Systems</title>
 
    <indexterm zone="creating-cluster-nfs">
     <primary>Network File Systems</primary>
@@ -188,22 +215,30 @@ postgres$ <userinput>initdb -D /usr/local/pgsql/data</userinput>
    <indexterm><primary>Network Attached Storage (<acronym>NAS</>)</><see>Network File Systems</></>
 
    <para>
-    Many installations create database clusters on network file systems.
-    Sometimes this is done directly via <acronym>NFS</>, or by using a
+    Many installations create their database clusters on network file
+    systems.  Sometimes this is done via <acronym>NFS</>, or by using a
     Network Attached Storage (<acronym>NAS</>) device that uses
     <acronym>NFS</> internally.  <productname>PostgreSQL</> does nothing
     special for <acronym>NFS</> file systems, meaning it assumes
-    <acronym>NFS</> behaves exactly like locally-connected drives
-    (<acronym>DAS</>, Direct Attached Storage).  If client and server
-    <acronym>NFS</> implementations have non-standard semantics, this can
+    <acronym>NFS</> behaves exactly like locally-connected drives.
+    If the client or server <acronym>NFS</> implementation does not
+    provide standard file system semantics, this can
     cause reliability problems (see <ulink
     url="http://www.time-travellers.org/shane/papers/NFS_considered_harmful.html"></ulink>).
     Specifically, delayed (asynchronous) writes to the <acronym>NFS</>
-    server can cause reliability problems;   if possible, mount
-    <acronym>NFS</> file systems synchronously (without caching) to avoid
-    this.  Also, soft-mounting <acronym>NFS</> is not recommended.
-    (Storage Area Networks (<acronym>SAN</>) use a low-level
-    communication protocol rather than <acronym>NFS</>.)
+    server can cause data corruption problems.  If possible, mount the
+    <acronym>NFS</> file system synchronously (without caching) to avoid
+    this hazard.  Also, soft-mounting the <acronym>NFS</> file system is
+    not recommended.
+   </para>
+
+   <para>
+    Storage Area Networks (<acronym>SAN</>) typically use communication
+    protocols other than <acronym>NFS</>, and may or may not be subject
+    to hazards of this sort.  It's advisable to consult the vendor's
+    documentation concerning data consistency guarantees.
+    <productname>PostgreSQL</productname> cannot be more reliable than
+    the file system it's using.
    </para>
 
   </sect2>
@@ -747,14 +782,13 @@ psql: could not connect to server: No such file or directory
 <screen>
 <prompt>#</prompt> <userinput>sysctl kern.ipc.shmall=32768</userinput>
 <prompt>#</prompt> <userinput>sysctl kern.ipc.shmmax=134217728</userinput>
-<prompt>#</prompt> <userinput>sysctl kern.ipc.semmap=256</userinput>
 </screen>
-        To have these settings persist over reboots, modify
+        To make these settings persist over reboots, modify
         <filename>/etc/sysctl.conf</filename>.
        </para>
 
        <para>
-        The remaining semaphore settings are read-only as far as
+        These semaphore-related settings are read-only as far as
         <command>sysctl</command> is concerned, but can be set in
         <filename>/boot/loader.conf</filename>:
 <programlisting>
@@ -763,7 +797,10 @@ kern.ipc.semmns=512
 kern.ipc.semmnu=256
 </programlisting>
         After modifying these values a reboot is required for the new
-        settings to take affect.
+        settings to take effect.
+        (Note: FreeBSD does not use <varname>SEMMAP</>.  Older versions
+        would accept but ignore a setting for <literal>kern.ipc.semmap</>;
+        newer versions reject it altogether.)
        </para>
 
        <para>
@@ -923,8 +960,8 @@ option        SEMMAP=256
 
 
      <varlistentry>
-      <term><systemitem class="osname">Mac OS X</>
-      <indexterm><primary>Mac OS X</><secondary>IPC configuration</></>
+      <term><systemitem class="osname">OS X</>
+      <indexterm><primary>OS X</><secondary>IPC configuration</></>
       </term>
       <listitem>
        <para>
@@ -1359,6 +1396,13 @@ $ <userinput>sysctl -w vm.nr_hugepages=3170</userinput>
    </para>
 
    <para>
+    It is also necessary to give the database server operating system
+    user permission to use huge pages by setting
+    <varname>vm.hugetlb_shm_group</> via <application>sysctl</>, and
+    permission to lock memory with <command>ulimit -l</>.
+   </para>
+
+   <para>
     The default behavior for huge pages in
     <productname>PostgreSQL</productname> is to use them when possible and
     to fallback to normal pages when failing. To enforce the use of huge
@@ -1432,10 +1476,11 @@ $ <userinput>sysctl -w vm.nr_hugepages=3170</userinput>
       <para>
       This is the <firstterm>Immediate Shutdown</firstterm> mode.
       The server will send <systemitem>SIGQUIT</systemitem> to all child
-      processes and wait for them to terminate.  Those that don't terminate
-      within 5 seconds, will be sent <systemitem>SIGKILL</systemitem> by the
-      master <command>postgres</command> process, which will then terminate
-      without further waiting.  This will lead to recovery (by
+      processes and wait for them to terminate.  If any do not terminate
+      within 5 seconds, they will be sent <systemitem>SIGKILL</systemitem>.
+      The master server process exits as soon as all child processes have
+      exited, without doing normal database shutdown processing.
+      This will lead to recovery (by
       replaying the WAL log) upon next start-up. This is recommended
       only in emergencies.
       </para>
@@ -1515,8 +1560,9 @@ $ <userinput>kill -INT `head -1 /usr/local/pgsql/data/postmaster.pid`</userinput
    For <emphasis>major</> releases of <productname>PostgreSQL</>, the
    internal data storage format is subject to change, thus complicating
    upgrades.  The traditional method for moving data to a new major version
-   is to dump and reload the database.  Other methods are available,
-   as discussed below.
+   is to dump and reload the database, though this can be slow.  A
+   faster method is <xref linkend="pgupgrade">.  Replication methods are
+   also available, as discussed below.
   </para>
 
   <para>
@@ -1591,12 +1637,14 @@ $ <userinput>kill -INT `head -1 /usr/local/pgsql/data/postmaster.pid`</userinput
 
   </variablelist>
 
-  <sect2 id="upgrade-methods-pgdump">
-   <title>Upgrading Data via <application>pg_dump</></title>
+  <sect2 id="upgrading-via-pgdumpall">
+   <title>Upgrading Data via <application>pg_dumpall</></title>
 
    <para>
-    To dump data from one major version of <productname>PostgreSQL</> and
-    reload it in another, you must use <application>pg_dump</>; file system
+    One upgrade method is to dump data from one major version of
+    <productname>PostgreSQL</> and reload it in another &mdash;  to do
+    this, you must use a <emphasis>logical</> backup tool like
+    <application>pg_dumpall</>; file system
     level backup methods will not work. (There are checks in place that prevent
     you from using a data directory with an incompatible version of
     <productname>PostgreSQL</productname>, so no great harm can be done by
@@ -1605,7 +1653,8 @@ $ <userinput>kill -INT `head -1 /usr/local/pgsql/data/postmaster.pid`</userinput
 
    <para>
     It is recommended that you use the <application>pg_dump</> and
-    <application>pg_dumpall</> programs from the newer version of
+    <application>pg_dumpall</> programs from the <emphasis>newer</>
+    version of
     <productname>PostgreSQL</>, to take advantage of enhancements
     that might have been made in these programs.  Current releases of the
     dump programs can read data from any server version back to 7.0.
@@ -1640,14 +1689,12 @@ $ <userinput>kill -INT `head -1 /usr/local/pgsql/data/postmaster.pid`</userinput
 <screen>
 <userinput>pg_dumpall &gt; <replaceable>outputfile</></userinput>
 </screen>
-      If you need to preserve OIDs (such as when using them as
-      foreign keys), then use the <option>-o</option> option when running
-      <application>pg_dumpall</>.
      </para>
 
      <para>
       To make the backup, you can use the <application>pg_dumpall</application>
-      command from the version you are currently running.  For best
+      command from the version you are currently running;  see <xref
+      linkend="backup-dump-all"> for more details.  For best
       results, however, try to use the <application>pg_dumpall</application>
       command from <productname>PostgreSQL</productname> &version;,
       since this version contains bug fixes and improvements over older
@@ -1681,7 +1728,8 @@ $ <userinput>kill -INT `head -1 /usr/local/pgsql/data/postmaster.pid`</userinput
     <step>
      <para>
       If restoring from backup, rename or delete the old installation
-      directory.  It is a good idea to rename the directory, rather than
+      directory if it is not version-specific.  It is a good idea to
+      rename the directory, rather than
       delete it, in case you have trouble and need to revert to it.  Keep
       in mind the directory might consume significant disk space.  To rename
       the directory, use a command like this:
@@ -1753,15 +1801,23 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
 
   </sect2>
 
-  <sect2 id="upgrading-methods-other">
-   <title>Non-Dump Upgrade Methods</title>
+  <sect2 id="upgrading-via-pg-upgrade">
+   <title>Upgrading Data via <application>pg_upgrade</></title>
 
    <para>
-    The <link linkend="pgupgrade">pg_upgrade</link> module allows an
-    installation to be migrated in-place from one major
-    <productname>PostgreSQL</> version to the next.  Upgrades can be
-    performed in minutes.
+    The <xref linkend="pgupgrade"> module allows an installation to
+    be migrated in-place from one major <productname>PostgreSQL</>
+    version to another.  Upgrades can be performed in minutes,
+    particularly with <option>--link</> mode.  It requires steps similar to
+    <application>pg_dumpall</> above, e.g.  starting/stopping the server,
+    running <application>initdb</>.  The <application>pg_upgrade</> <link
+    linkend="pgupgrade">documentation</> outlines the necessary steps.
    </para>
+
+  </sect2>
+
+  <sect2 id="upgrading-via-replication">
+   <title>Upgrading Data via Replication</title>
 
    <para>
     It is also possible to use certain replication methods, such as
@@ -2084,7 +2140,7 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
    are also checked if the parameter <xref linkend="guc-ssl-crl-file"> is set.
    <!-- If this URL changes replace it with a URL to www.archive.org. -->
    (See <ulink
-   url="http://h71000.www7.hp.com/DOC/83final/BA554_90007/ch04s02.html"></>
+   url="http://h71000.www7.hp.com/doc/83final/ba554_90007/ch04s02.html"></>
    for diagrams showing SSL certificate usage.)
   </para>
 

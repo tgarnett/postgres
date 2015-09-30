@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2015, PostgreSQL Global Development Group
  *
  * src/bin/psql/tab-complete.c
  */
@@ -545,7 +545,8 @@ static const SchemaQuery Query_for_list_of_matviews = {
 "SELECT name FROM "\
 " (SELECT pg_catalog.lower(name) AS name FROM pg_catalog.pg_settings "\
 "  WHERE context != 'internal') ss "\
-" WHERE substring(name,1,%d)='%s'"
+" WHERE substring(name,1,%d)='%s'"\
+" UNION ALL SELECT 'all' ss"
 
 #define Query_for_list_of_set_vars \
 "SELECT name FROM "\
@@ -575,7 +576,9 @@ static const SchemaQuery Query_for_list_of_matviews = {
 " SELECT pg_catalog.quote_ident(rolname) "\
 "   FROM pg_catalog.pg_roles "\
 "  WHERE substring(pg_catalog.quote_ident(rolname),1,%d)='%s'"\
-" UNION ALL SELECT 'PUBLIC'"
+" UNION ALL SELECT 'PUBLIC'"\
+" UNION ALL SELECT 'CURRENT_USER'"\
+" UNION ALL SELECT 'SESSION_USER'"
 
 /* the silly-looking length condition is just to eat up the current word */
 #define Query_for_table_owning_index \
@@ -736,6 +739,35 @@ static const SchemaQuery Query_for_list_of_matviews = {
 "   FROM pg_catalog.pg_event_trigger "\
 "  WHERE substring(pg_catalog.quote_ident(evtname),1,%d)='%s'"
 
+#define Query_for_list_of_tablesample_methods \
+" SELECT pg_catalog.quote_ident(proname) "\
+"   FROM pg_catalog.pg_proc "\
+"  WHERE prorettype = 'pg_catalog.tsm_handler'::pg_catalog.regtype AND "\
+"        proargtypes[0] = 'pg_catalog.internal'::pg_catalog.regtype AND "\
+"        substring(pg_catalog.quote_ident(proname),1,%d)='%s'"
+
+#define Query_for_list_of_policies \
+" SELECT pg_catalog.quote_ident(polname) "\
+"   FROM pg_catalog.pg_policy "\
+"  WHERE substring(pg_catalog.quote_ident(polname),1,%d)='%s'"
+
+#define Query_for_list_of_tables_for_policy \
+"SELECT pg_catalog.quote_ident(relname) "\
+"  FROM pg_catalog.pg_class"\
+" WHERE (%d = pg_catalog.length('%s'))"\
+"   AND oid IN "\
+"       (SELECT polrelid FROM pg_catalog.pg_policy "\
+"         WHERE pg_catalog.quote_ident(polname)='%s')"
+
+#define Query_for_enum \
+" SELECT name FROM ( "\
+"   SELECT pg_catalog.quote_ident(pg_catalog.unnest(enumvals)) AS name "\
+"     FROM pg_catalog.pg_settings "\
+"    WHERE pg_catalog.lower(name)=pg_catalog.lower('%s') "\
+"    UNION ALL " \
+"   SELECT 'DEFAULT' ) ss "\
+"  WHERE pg_catalog.substring(name,1,%%d)='%%s'"
+
 /*
  * This is a list of all "things" in Pgsql, which can show up after CREATE or
  * DROP; and there is also a query to get a list of them.
@@ -781,6 +813,7 @@ static const pgsql_thing_t words_after_create[] = {
 								 * good idea. */
 	{"OWNED", NULL, NULL, THING_NO_CREATE},		/* for DROP OWNED BY ... */
 	{"PARSER", Query_for_list_of_ts_parsers, NULL, THING_NO_SHOW},
+	{"POLICY", NULL, NULL},
 	{"ROLE", Query_for_list_of_roles},
 	{"RULE", "SELECT pg_catalog.quote_ident(rulename) FROM pg_catalog.pg_rules WHERE substring(pg_catalog.quote_ident(rulename),1,%d)='%s'"},
 	{"SCHEMA", Query_for_list_of_schemas},
@@ -813,14 +846,20 @@ static char *_complete_from_query(int is_schema_query,
 					 const char *text, int state);
 static char *complete_from_list(const char *text, int state);
 static char *complete_from_const(const char *text, int state);
+static void append_variable_names(char ***varnames, int *nvars,
+					  int *maxvars, const char *varname,
+					  const char *prefix, const char *suffix);
 static char **complete_from_variables(const char *text,
-						const char *prefix, const char *suffix);
+					const char *prefix, const char *suffix, bool need_value);
 static char *complete_from_files(const char *text, int state);
 
 static char *pg_strdup_keyword_case(const char *s, const char *ref);
+static char *escape_string(const char *text);
 static PGresult *exec_query(const char *query);
 
 static void get_previous_words(int point, char **previous_words, int nwords);
+
+static char *get_guctype(const char *varname);
 
 #ifdef NOT_USED
 static char *quote_file_name(char *text, int match_type, char *quote_pointer);
@@ -863,7 +902,7 @@ psql_completion(const char *text, int start, int end)
 	char	  **matches = NULL;
 
 	/* This array will contain some scannage of the input line. */
-	char	   *previous_words[6];
+	char	   *previous_words[9];
 
 	/* For compactness, we use these macros to reference previous_words[]. */
 #define prev_wd   (previous_words[0])
@@ -872,6 +911,9 @@ psql_completion(const char *text, int start, int end)
 #define prev4_wd  (previous_words[3])
 #define prev5_wd  (previous_words[4])
 #define prev6_wd  (previous_words[5])
+#define prev7_wd  (previous_words[6])
+#define prev8_wd  (previous_words[7])
+#define prev9_wd  (previous_words[8])
 
 	static const char *const sql_commands[] = {
 		"ABORT", "ALTER", "ANALYZE", "BEGIN", "CHECKPOINT", "CLOSE", "CLUSTER",
@@ -887,14 +929,16 @@ psql_completion(const char *text, int start, int end)
 
 	static const char *const backslash_commands[] = {
 		"\\a", "\\connect", "\\conninfo", "\\C", "\\cd", "\\copy", "\\copyright",
-		"\\d", "\\da", "\\db", "\\dc", "\\dC", "\\dd", "\\dD", "\\des", "\\det", "\\deu", "\\dew", "\\df",
+		"\\d", "\\da", "\\db", "\\dc", "\\dC", "\\dd", "\\ddp", "\\dD",
+		"\\des", "\\det", "\\deu", "\\dew", "\\dE", "\\df",
 		"\\dF", "\\dFd", "\\dFp", "\\dFt", "\\dg", "\\di", "\\dl", "\\dL",
-		"\\dn", "\\do", "\\dp", "\\drds", "\\ds", "\\dS", "\\dt", "\\dT", "\\dv", "\\du", "\\dx",
-		"\\e", "\\echo", "\\ef", "\\encoding",
+		"\\dm", "\\dn", "\\do", "\\dO", "\\dp", "\\drds", "\\ds", "\\dS",
+		"\\dt", "\\dT", "\\dv", "\\du", "\\dx", "\\dy",
+		"\\e", "\\echo", "\\ef", "\\encoding", "\\ev",
 		"\\f", "\\g", "\\gset", "\\h", "\\help", "\\H", "\\i", "\\ir", "\\l",
 		"\\lo_import", "\\lo_export", "\\lo_list", "\\lo_unlink",
 		"\\o", "\\p", "\\password", "\\prompt", "\\pset", "\\q", "\\qecho", "\\r",
-		"\\set", "\\sf", "\\t", "\\T",
+		"\\s", "\\set", "\\setenv", "\\sf", "\\sv", "\\t", "\\T",
 		"\\timing", "\\unset", "\\x", "\\w", "\\watch", "\\z", "\\!", NULL
 	};
 
@@ -925,11 +969,11 @@ psql_completion(const char *text, int start, int end)
 	else if (text[0] == ':' && text[1] != ':')
 	{
 		if (text[1] == '\'')
-			matches = complete_from_variables(text, ":'", "'");
+			matches = complete_from_variables(text, ":'", "'", true);
 		else if (text[1] == '"')
-			matches = complete_from_variables(text, ":\"", "\"");
+			matches = complete_from_variables(text, ":\"", "\"", true);
 		else
-			matches = complete_from_variables(text, ":", "");
+			matches = complete_from_variables(text, ":", "", true);
 	}
 
 	/* If no previous word, suggest one of the basic sql commands */
@@ -949,6 +993,14 @@ psql_completion(const char *text, int start, int end)
 
 /* ALTER */
 
+	/* ALTER TABLE */
+	else if (pg_strcasecmp(prev2_wd, "ALTER") == 0 &&
+			 pg_strcasecmp(prev_wd, "TABLE") == 0)
+	{
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables,
+								   "UNION SELECT 'ALL IN TABLESPACE'");
+	}
+
 	/*
 	 * complete with what you can alter (TABLE, GROUP, USER, ...) unless we're
 	 * in ALTER TABLE sth ALTER
@@ -960,11 +1012,30 @@ psql_completion(const char *text, int start, int end)
 		{"AGGREGATE", "COLLATION", "CONVERSION", "DATABASE", "DEFAULT PRIVILEGES", "DOMAIN",
 			"EVENT TRIGGER", "EXTENSION", "FOREIGN DATA WRAPPER", "FOREIGN TABLE", "FUNCTION",
 			"GROUP", "INDEX", "LANGUAGE", "LARGE OBJECT", "MATERIALIZED VIEW", "OPERATOR",
-			"ROLE", "RULE", "SCHEMA", "SERVER", "SEQUENCE", "SYSTEM SET", "TABLE",
+			"POLICY", "ROLE", "RULE", "SCHEMA", "SERVER", "SEQUENCE", "SYSTEM", "TABLE",
 			"TABLESPACE", "TEXT SEARCH", "TRIGGER", "TYPE",
 		"USER", "USER MAPPING FOR", "VIEW", NULL};
 
 		COMPLETE_WITH_LIST(list_ALTER);
+	}
+	/* ALTER TABLE,INDEX,MATERIALIZED VIEW xxx ALL IN TABLESPACE xxx */
+	else if (pg_strcasecmp(prev4_wd, "ALL") == 0 &&
+			 pg_strcasecmp(prev3_wd, "IN") == 0 &&
+			 pg_strcasecmp(prev2_wd, "TABLESPACE") == 0)
+	{
+		static const char *const list_ALTERALLINTSPC[] =
+		{"SET TABLESPACE", "OWNED BY", NULL};
+
+		COMPLETE_WITH_LIST(list_ALTERALLINTSPC);
+	}
+	/* ALTER TABLE,INDEX,MATERIALIZED VIEW xxx ALL IN TABLESPACE xxx OWNED BY */
+	else if (pg_strcasecmp(prev6_wd, "ALL") == 0 &&
+			 pg_strcasecmp(prev5_wd, "IN") == 0 &&
+			 pg_strcasecmp(prev4_wd, "TABLESPACE") == 0 &&
+			 pg_strcasecmp(prev2_wd, "OWNED") == 0 &&
+			 pg_strcasecmp(prev4_wd, "BY") == 0)
+	{
+		COMPLETE_WITH_QUERY(Query_for_list_of_roles);
 	}
 	/* ALTER AGGREGATE,FUNCTION <name> */
 	else if (pg_strcasecmp(prev3_wd, "ALTER") == 0 &&
@@ -1097,11 +1168,20 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev2_wd, "TABLE") == 0)
 	{
 		static const char *const list_ALTER_FOREIGN_TABLE[] =
-		{"ALTER", "DROP", "RENAME", "OWNER TO", "SET SCHEMA", NULL};
+		{"ADD", "ALTER", "DISABLE TRIGGER", "DROP", "ENABLE", "INHERIT",
+			"NO INHERIT", "OPTIONS", "OWNER TO", "RENAME", "SET",
+		"VALIDATE CONSTRAINT", NULL};
 
 		COMPLETE_WITH_LIST(list_ALTER_FOREIGN_TABLE);
 	}
 
+	/* ALTER INDEX */
+	else if (pg_strcasecmp(prev2_wd, "ALTER") == 0 &&
+			 pg_strcasecmp(prev_wd, "INDEX") == 0)
+	{
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes,
+								   "UNION SELECT 'ALL IN TABLESPACE'");
+	}
 	/* ALTER INDEX <name> */
 	else if (pg_strcasecmp(prev3_wd, "ALTER") == 0 &&
 			 pg_strcasecmp(prev2_wd, "INDEX") == 0)
@@ -1134,7 +1214,7 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev_wd, "(") == 0)
 	{
 		static const char *const list_INDEXOPTIONS[] =
-		{"fillfactor", "fastupdate", NULL};
+		{"fillfactor", "fastupdate", "gin_pending_list_limit", NULL};
 
 		COMPLETE_WITH_LIST(list_INDEXOPTIONS);
 	}
@@ -1165,7 +1245,8 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev2_wd, "MATERIALIZED") == 0 &&
 			 pg_strcasecmp(prev_wd, "VIEW") == 0)
 	{
-		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_matviews, NULL);
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_matviews,
+								   "UNION SELECT 'ALL IN TABLESPACE'");
 	}
 
 	/* ALTER USER,ROLE <name> */
@@ -1175,11 +1256,12 @@ psql_completion(const char *text, int start, int end)
 			  pg_strcasecmp(prev2_wd, "ROLE") == 0))
 	{
 		static const char *const list_ALTERUSER[] =
-		{"CONNECTION LIMIT", "CREATEDB", "CREATEROLE", "CREATEUSER",
-			"ENCRYPTED", "INHERIT", "LOGIN", "NOCREATEDB", "NOCREATEROLE",
-			"NOCREATEUSER", "NOINHERIT", "NOLOGIN", "NOREPLICATION",
-			"NOSUPERUSER", "RENAME TO", "REPLICATION", "RESET", "SET",
-		"SUPERUSER", "UNENCRYPTED", "VALID UNTIL", "WITH", NULL};
+		{"BYPASSRLS", "CONNECTION LIMIT", "CREATEDB", "CREATEROLE",
+			"CREATEUSER", "ENCRYPTED", "INHERIT", "LOGIN", "NOBYPASSRLS",
+			"NOCREATEDB", "NOCREATEROLE", "NOCREATEUSER", "NOINHERIT",
+			"NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD", "RENAME TO",
+			"REPLICATION", "RESET", "SET", "SUPERUSER", "UNENCRYPTED",
+		"VALID UNTIL", "WITH", NULL};
 
 		COMPLETE_WITH_LIST(list_ALTERUSER);
 	}
@@ -1192,11 +1274,12 @@ psql_completion(const char *text, int start, int end)
 	{
 		/* Similar to the above, but don't complete "WITH" again. */
 		static const char *const list_ALTERUSER_WITH[] =
-		{"CONNECTION LIMIT", "CREATEDB", "CREATEROLE", "CREATEUSER",
-			"ENCRYPTED", "INHERIT", "LOGIN", "NOCREATEDB", "NOCREATEROLE",
-			"NOCREATEUSER", "NOINHERIT", "NOLOGIN", "NOREPLICATION",
-			"NOSUPERUSER", "RENAME TO", "REPLICATION", "RESET", "SET",
-		"SUPERUSER", "UNENCRYPTED", "VALID UNTIL", NULL};
+		{"BYPASSRLS", "CONNECTION LIMIT", "CREATEDB", "CREATEROLE",
+			"CREATEUSER", "ENCRYPTED", "INHERIT", "LOGIN", "NOBYPASSRLS",
+			"NOCREATEDB", "NOCREATEROLE", "NOCREATEUSER", "NOINHERIT",
+			"NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD", "RENAME TO",
+			"REPLICATION", "RESET", "SET", "SUPERUSER", "UNENCRYPTED",
+		"VALID UNTIL", NULL};
 
 		COMPLETE_WITH_LIST(list_ALTERUSER_WITH);
 	}
@@ -1325,10 +1408,20 @@ psql_completion(const char *text, int start, int end)
 
 		COMPLETE_WITH_LIST(list_ALTER_SERVER);
 	}
-	/* ALTER SYSTEM SET <name> */
+	/* ALTER SYSTEM SET, RESET, RESET ALL */
+	else if (pg_strcasecmp(prev2_wd, "ALTER") == 0 &&
+			 pg_strcasecmp(prev_wd, "SYSTEM") == 0)
+	{
+		static const char *const list_ALTERSYSTEM[] =
+		{"SET", "RESET", NULL};
+
+		COMPLETE_WITH_LIST(list_ALTERSYSTEM);
+	}
+	/* ALTER SYSTEM SET|RESET <name> */
 	else if (pg_strcasecmp(prev3_wd, "ALTER") == 0 &&
 			 pg_strcasecmp(prev2_wd, "SYSTEM") == 0 &&
-			 pg_strcasecmp(prev_wd, "SET") == 0)
+			 (pg_strcasecmp(prev_wd, "SET") == 0 ||
+			  pg_strcasecmp(prev_wd, "RESET") == 0))
 		COMPLETE_WITH_QUERY(Query_for_list_of_alter_system_set_vars);
 	/* ALTER VIEW <name> */
 	else if (pg_strcasecmp(prev3_wd, "ALTER") == 0 &&
@@ -1349,6 +1442,44 @@ psql_completion(const char *text, int start, int end)
 
 		COMPLETE_WITH_LIST(list_ALTERMATVIEW);
 	}
+
+	/* ALTER POLICY <name> ON */
+	else if (pg_strcasecmp(prev3_wd, "ALTER") == 0 &&
+			 pg_strcasecmp(prev2_wd, "POLICY") == 0)
+		COMPLETE_WITH_CONST("ON");
+	/* ALTER POLICY <name> ON <table> */
+	else if (pg_strcasecmp(prev4_wd, "ALTER") == 0 &&
+			 pg_strcasecmp(prev3_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev_wd, "ON") == 0)
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables, NULL);
+	/* ALTER POLICY <name> ON <table> - show options */
+	else if (pg_strcasecmp(prev5_wd, "ALTER") == 0 &&
+			 pg_strcasecmp(prev4_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev2_wd, "ON") == 0)
+	{
+		static const char *const list_ALTERPOLICY[] =
+		{"RENAME TO", "TO", "USING", "WITH CHECK", NULL};
+
+		COMPLETE_WITH_LIST(list_ALTERPOLICY);
+	}
+	/* ALTER POLICY <name> ON <table> TO <role> */
+	else if (pg_strcasecmp(prev6_wd, "ALTER") == 0 &&
+			 pg_strcasecmp(prev5_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev3_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev_wd, "TO") == 0)
+		COMPLETE_WITH_QUERY(Query_for_list_of_grant_roles);
+	/* ALTER POLICY <name> ON <table> USING ( */
+	else if (pg_strcasecmp(prev6_wd, "ALTER") == 0 &&
+			 pg_strcasecmp(prev5_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev3_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev_wd, "USING") == 0)
+		COMPLETE_WITH_CONST("(");
+	/* ALTER POLICY <name> ON <table> WITH CHECK ( */
+	else if (pg_strcasecmp(prev6_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev4_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev2_wd, "WITH") == 0 &&
+			 pg_strcasecmp(prev_wd, "CHECK") == 0)
+		COMPLETE_WITH_CONST("(");
 
 	/* ALTER RULE <name>, add ON */
 	else if (pg_strcasecmp(prev3_wd, "ALTER") == 0 &&
@@ -1414,7 +1545,7 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev_wd, "ENABLE") == 0)
 	{
 		static const char *const list_ALTERENABLE[] =
-		{"ALWAYS", "REPLICA", "RULE", "TRIGGER", NULL};
+		{"ALWAYS", "REPLICA", "ROW LEVEL SECURITY", "RULE", "TRIGGER", NULL};
 
 		COMPLETE_WITH_LIST(list_ALTERENABLE);
 	}
@@ -1481,7 +1612,7 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev_wd, "DISABLE") == 0)
 	{
 		static const char *const list_ALTERDISABLE[] =
-		{"RULE", "TRIGGER", NULL};
+		{"ROW LEVEL SECURITY", "RULE", "TRIGGER", NULL};
 
 		COMPLETE_WITH_LIST(list_ALTERDISABLE);
 	}
@@ -1501,12 +1632,22 @@ psql_completion(const char *text, int start, int end)
 		completion_info_charp = prev3_wd;
 		COMPLETE_WITH_QUERY(Query_for_trigger_of_table);
 	}
+	else if (pg_strcasecmp(prev4_wd, "DISABLE") == 0 &&
+			 pg_strcasecmp(prev3_wd, "ROW") == 0 &&
+			 pg_strcasecmp(prev2_wd, "LEVEL") == 0 &&
+			 pg_strcasecmp(prev_wd, "SECURITY") == 0)
+	{
+		static const char *const list_DISABLERLS[] =
+		{"CASCADE", NULL};
+
+		COMPLETE_WITH_LIST(list_DISABLERLS);
+	}
 
 	/* ALTER TABLE xxx ALTER */
 	else if (pg_strcasecmp(prev4_wd, "ALTER") == 0 &&
 			 pg_strcasecmp(prev3_wd, "TABLE") == 0 &&
 			 pg_strcasecmp(prev_wd, "ALTER") == 0)
-		COMPLETE_WITH_ATTR(prev2_wd, " UNION SELECT 'COLUMN'");
+		COMPLETE_WITH_ATTR(prev2_wd, " UNION SELECT 'COLUMN' UNION SELECT 'CONSTRAINT'");
 
 	/* ALTER TABLE xxx RENAME */
 	else if (pg_strcasecmp(prev4_wd, "ALTER") == 0 &&
@@ -1556,12 +1697,13 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_ATTR(prev3_wd, "");
 
 	/*
-	 * If we have ALTER TABLE <sth> DROP|RENAME|VALIDATE CONSTRAINT, provide
-	 * list of constraints
+	 * If we have ALTER TABLE <sth> ALTER|DROP|RENAME|VALIDATE CONSTRAINT,
+	 * provide list of constraints
 	 */
 	else if (pg_strcasecmp(prev5_wd, "ALTER") == 0 &&
 			 pg_strcasecmp(prev4_wd, "TABLE") == 0 &&
-			 (pg_strcasecmp(prev2_wd, "DROP") == 0 ||
+			 (pg_strcasecmp(prev2_wd, "ALTER") == 0 ||
+			  pg_strcasecmp(prev2_wd, "DROP") == 0 ||
 			  pg_strcasecmp(prev2_wd, "RENAME") == 0 ||
 			  pg_strcasecmp(prev2_wd, "VALIDATE") == 0) &&
 			 pg_strcasecmp(prev_wd, "CONSTRAINT") == 0)
@@ -1638,12 +1780,12 @@ psql_completion(const char *text, int start, int end)
 		completion_info_charp = prev3_wd;
 		COMPLETE_WITH_QUERY(Query_for_index_of_table);
 	}
-	/* If we have TABLE <sth> SET, provide WITHOUT,TABLESPACE and SCHEMA */
+	/* If we have TABLE <sth> SET, provide list of attributes and '(' */
 	else if (pg_strcasecmp(prev3_wd, "TABLE") == 0 &&
 			 pg_strcasecmp(prev_wd, "SET") == 0)
 	{
 		static const char *const list_TABLESET[] =
-		{"(", "WITHOUT", "TABLESPACE", "SCHEMA", NULL};
+		{"(", "LOGGED", "SCHEMA", "TABLESPACE", "UNLOGGED", "WITH", "WITHOUT", NULL};
 
 		COMPLETE_WITH_LIST(list_TABLESET);
 	}
@@ -1680,19 +1822,28 @@ psql_completion(const char *text, int start, int end)
 			"autovacuum_freeze_max_age",
 			"autovacuum_freeze_min_age",
 			"autovacuum_freeze_table_age",
+			"autovacuum_multixact_freeze_max_age",
+			"autovacuum_multixact_freeze_min_age",
+			"autovacuum_multixact_freeze_table_age",
 			"autovacuum_vacuum_cost_delay",
 			"autovacuum_vacuum_cost_limit",
 			"autovacuum_vacuum_scale_factor",
 			"autovacuum_vacuum_threshold",
 			"fillfactor",
+			"log_autovacuum_min_duration",
 			"toast.autovacuum_enabled",
 			"toast.autovacuum_freeze_max_age",
 			"toast.autovacuum_freeze_min_age",
 			"toast.autovacuum_freeze_table_age",
+			"toast.autovacuum_multixact_freeze_max_age",
+			"toast.autovacuum_multixact_freeze_min_age",
+			"toast.autovacuum_multixact_freeze_table_age",
 			"toast.autovacuum_vacuum_cost_delay",
 			"toast.autovacuum_vacuum_cost_limit",
 			"toast.autovacuum_vacuum_scale_factor",
 			"toast.autovacuum_vacuum_threshold",
+			"toast.log_autovacuum_min_duration",
+			"user_catalog_table",
 			NULL
 		};
 
@@ -1728,12 +1879,12 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_CONST("IDENTITY");
 	}
 
-	/* ALTER TABLESPACE <foo> with RENAME TO, OWNER TO, SET, RESET, MOVE */
+	/* ALTER TABLESPACE <foo> with RENAME TO, OWNER TO, SET, RESET */
 	else if (pg_strcasecmp(prev3_wd, "ALTER") == 0 &&
 			 pg_strcasecmp(prev2_wd, "TABLESPACE") == 0)
 	{
 		static const char *const list_ALTERTSPC[] =
-		{"RENAME TO", "OWNER TO", "SET", "RESET", "MOVE", NULL};
+		{"RENAME TO", "OWNER TO", "SET", "RESET", NULL};
 
 		COMPLETE_WITH_LIST(list_ALTERTSPC);
 	}
@@ -1751,30 +1902,9 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev_wd, "(") == 0)
 	{
 		static const char *const list_TABLESPACEOPTIONS[] =
-		{"seq_page_cost", "random_page_cost", NULL};
+		{"seq_page_cost", "random_page_cost", "effective_io_concurrency", NULL};
 
 		COMPLETE_WITH_LIST(list_TABLESPACEOPTIONS);
-	}
-	/* ALTER TABLESPACE <foo> MOVE ALL|TABLES|INDEXES|MATERIALIZED VIEWS */
-	else if (pg_strcasecmp(prev4_wd, "ALTER") == 0 &&
-			 pg_strcasecmp(prev3_wd, "TABLESPACE") == 0 &&
-			 pg_strcasecmp(prev_wd, "MOVE") == 0)
-	{
-		static const char *const list_TABLESPACEMOVETARGETS[] =
-		{"ALL", "TABLES", "INDEXES", "MATERIALIZED VIEWS", NULL};
-
-		COMPLETE_WITH_LIST(list_TABLESPACEMOVETARGETS);
-	}
-	else if ((pg_strcasecmp(prev4_wd, "TABLESPACE") == 0 &&
-			  pg_strcasecmp(prev2_wd, "MOVE") == 0) ||
-			 (pg_strcasecmp(prev5_wd, "TABLESPACE") == 0 &&
-			  pg_strcasecmp(prev3_wd, "MOVE") == 0 &&
-			  pg_strcasecmp(prev2_wd, "MATERIALIZED") == 0))
-	{
-		static const char *const list_TABLESPACEMOVEOPTIONS[] =
-		{"OWNED BY", "TO", NULL};
-
-		COMPLETE_WITH_LIST(list_TABLESPACEMOVEOPTIONS);
 	}
 
 	/* ALTER TEXT SEARCH */
@@ -1984,7 +2114,7 @@ psql_completion(const char *text, int start, int end)
 		static const char *const list_COMMENT[] =
 		{"CAST", "COLLATION", "CONVERSION", "DATABASE", "EVENT TRIGGER", "EXTENSION",
 			"FOREIGN DATA WRAPPER", "FOREIGN TABLE",
-			"SERVER", "INDEX", "LANGUAGE", "RULE", "SCHEMA", "SEQUENCE",
+			"SERVER", "INDEX", "LANGUAGE", "POLICY", "RULE", "SCHEMA", "SEQUENCE",
 			"TABLE", "TYPE", "VIEW", "MATERIALIZED VIEW", "COLUMN", "AGGREGATE", "FUNCTION",
 			"OPERATOR", "TRIGGER", "CONSTRAINT", "DOMAIN", "LARGE OBJECT",
 		"TABLESPACE", "TEXT SEARCH", "ROLE", NULL};
@@ -2044,12 +2174,13 @@ psql_completion(const char *text, int start, int end)
 	{
 		COMPLETE_WITH_QUERY(Query_for_list_of_event_triggers);
 	}
-	else if ((pg_strcasecmp(prev4_wd, "COMMENT") == 0 &&
-			  pg_strcasecmp(prev3_wd, "ON") == 0) ||
-			 (pg_strcasecmp(prev5_wd, "COMMENT") == 0 &&
-			  pg_strcasecmp(prev4_wd, "ON") == 0) ||
-			 (pg_strcasecmp(prev6_wd, "COMMENT") == 0 &&
-			  pg_strcasecmp(prev5_wd, "ON") == 0))
+	else if (((pg_strcasecmp(prev4_wd, "COMMENT") == 0 &&
+			   pg_strcasecmp(prev3_wd, "ON") == 0) ||
+			  (pg_strcasecmp(prev5_wd, "COMMENT") == 0 &&
+			   pg_strcasecmp(prev4_wd, "ON") == 0) ||
+			  (pg_strcasecmp(prev6_wd, "COMMENT") == 0 &&
+			   pg_strcasecmp(prev5_wd, "ON") == 0)) &&
+			 pg_strcasecmp(prev_wd, "IS") != 0)
 		COMPLETE_WITH_CONST("IS");
 
 /* COPY */
@@ -2114,7 +2245,7 @@ psql_completion(const char *text, int start, int end)
 	{
 		static const char *const list_DATABASE[] =
 		{"OWNER", "TEMPLATE", "ENCODING", "TABLESPACE", "IS_TEMPLATE",
-		"ALLOW_CONNECTIONS", "CONNECTION LIMIT", "LC_COLLATE", "LC_CTYPE",
+			"ALLOW_CONNECTIONS", "CONNECTION LIMIT", "LC_COLLATE", "LC_CTYPE",
 		NULL};
 
 		COMPLETE_WITH_LIST(list_DATABASE);
@@ -2217,10 +2348,108 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev_wd, "(") == 0)
 		COMPLETE_WITH_ATTR(prev4_wd, "");
 	/* Complete USING with an index method */
-	else if (pg_strcasecmp(prev_wd, "USING") == 0)
+	else if ((pg_strcasecmp(prev6_wd, "INDEX") == 0 ||
+			  pg_strcasecmp(prev5_wd, "INDEX") == 0 ||
+			  pg_strcasecmp(prev4_wd, "INDEX") == 0) &&
+			 pg_strcasecmp(prev3_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev_wd, "USING") == 0)
 		COMPLETE_WITH_QUERY(Query_for_list_of_access_methods);
 	else if (pg_strcasecmp(prev4_wd, "ON") == 0 &&
+			 (!(pg_strcasecmp(prev6_wd, "POLICY") == 0) &&
+			  !(pg_strcasecmp(prev4_wd, "FOR") == 0)) &&
 			 pg_strcasecmp(prev2_wd, "USING") == 0)
+		COMPLETE_WITH_CONST("(");
+
+	/* CREATE POLICY */
+	/* Complete "CREATE POLICY <name> ON" */
+	else if (pg_strcasecmp(prev3_wd, "CREATE") == 0 &&
+			 pg_strcasecmp(prev2_wd, "POLICY") == 0)
+		COMPLETE_WITH_CONST("ON");
+	/* Complete "CREATE POLICY <name> ON <table>" */
+	else if (pg_strcasecmp(prev4_wd, "CREATE") == 0 &&
+			 pg_strcasecmp(prev3_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev_wd, "ON") == 0)
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables, NULL);
+	/* Complete "CREATE POLICY <name> ON <table> FOR|TO|USING|WITH CHECK" */
+	else if (pg_strcasecmp(prev5_wd, "CREATE") == 0 &&
+			 pg_strcasecmp(prev4_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev2_wd, "ON") == 0)
+	{
+		static const char *const list_POLICYOPTIONS[] =
+		{"FOR", "TO", "USING", "WITH CHECK", NULL};
+
+		COMPLETE_WITH_LIST(list_POLICYOPTIONS);
+	}
+
+	/*
+	 * Complete "CREATE POLICY <name> ON <table> FOR
+	 * ALL|SELECT|INSERT|UPDATE|DELETE"
+	 */
+	else if (pg_strcasecmp(prev6_wd, "CREATE") == 0 &&
+			 pg_strcasecmp(prev5_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev3_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev_wd, "FOR") == 0)
+	{
+		static const char *const list_POLICYCMDS[] =
+		{"ALL", "SELECT", "INSERT", "UPDATE", "DELETE", NULL};
+
+		COMPLETE_WITH_LIST(list_POLICYCMDS);
+	}
+	/* Complete "CREATE POLICY <name> ON <table> FOR INSERT TO|WITH CHECK" */
+	else if (pg_strcasecmp(prev6_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev4_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev2_wd, "FOR") == 0 &&
+			 pg_strcasecmp(prev_wd, "INSERT") == 0)
+	{
+		static const char *const list_POLICYOPTIONS[] =
+		{"TO", "WITH CHECK", NULL};
+
+		COMPLETE_WITH_LIST(list_POLICYOPTIONS);
+	}
+
+	/*
+	 * Complete "CREATE POLICY <name> ON <table> FOR SELECT TO|USING" Complete
+	 * "CREATE POLICY <name> ON <table> FOR DELETE TO|USING"
+	 */
+	else if (pg_strcasecmp(prev6_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev4_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev2_wd, "FOR") == 0 &&
+			 (pg_strcasecmp(prev_wd, "SELECT") == 0 ||
+			  pg_strcasecmp(prev_wd, "DELETE") == 0))
+	{
+		static const char *const list_POLICYOPTIONS[] =
+		{"TO", "USING", NULL};
+
+		COMPLETE_WITH_LIST(list_POLICYOPTIONS);
+	}
+
+	/*
+	 * Complete "CREATE POLICY <name> ON <table> FOR ALL TO|USING|WITH CHECK"
+	 * Complete "CREATE POLICY <name> ON <table> FOR UPDATE TO|USING|WITH
+	 * CHECK"
+	 */
+	else if (pg_strcasecmp(prev6_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev4_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev2_wd, "FOR") == 0 &&
+			 (pg_strcasecmp(prev_wd, "ALL") == 0 ||
+			  pg_strcasecmp(prev_wd, "UPDATE") == 0))
+	{
+		static const char *const list_POLICYOPTIONS[] =
+		{"TO", "USING", "WITH CHECK", NULL};
+
+		COMPLETE_WITH_LIST(list_POLICYOPTIONS);
+	}
+	/* Complete "CREATE POLICY <name> ON <table> TO <role>" */
+	else if (pg_strcasecmp(prev6_wd, "CREATE") == 0 &&
+			 pg_strcasecmp(prev5_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev3_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev_wd, "TO") == 0)
+		COMPLETE_WITH_QUERY(Query_for_list_of_grant_roles);
+	/* Complete "CREATE POLICY <name> ON <table> USING (" */
+	else if (pg_strcasecmp(prev6_wd, "CREATE") == 0 &&
+			 pg_strcasecmp(prev5_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev3_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev_wd, "USING") == 0)
 		COMPLETE_WITH_CONST("(");
 
 /* CREATE RULE */
@@ -2254,6 +2483,35 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev3_wd, "ON") == 0 &&
 			 pg_strcasecmp(prev_wd, "TO") == 0)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables, NULL);
+
+/* CREATE TEMP/TEMPORARY SEQUENCE <name> */
+	else if ((pg_strcasecmp(prev3_wd, "CREATE") == 0 &&
+			  pg_strcasecmp(prev2_wd, "SEQUENCE") == 0) ||
+			 (pg_strcasecmp(prev4_wd, "CREATE") == 0 &&
+			  (pg_strcasecmp(prev3_wd, "TEMP") == 0 ||
+			   pg_strcasecmp(prev3_wd, "TEMPORARY") == 0) &&
+			  pg_strcasecmp(prev2_wd, "SEQUENCE") == 0))
+	{
+		static const char *const list_CREATESEQUENCE[] =
+		{"INCREMENT BY", "MINVALUE", "MAXVALUE", "NO", "CACHE",
+		 "CYCLE", "OWNED BY", "START WITH", NULL};
+
+		COMPLETE_WITH_LIST(list_CREATESEQUENCE);
+	}
+/* CREATE TEMP/TEMPORARY SEQUENCE <name> NO */
+	else if (((pg_strcasecmp(prev4_wd, "CREATE") == 0 &&
+			  pg_strcasecmp(prev3_wd, "SEQUENCE") == 0) ||
+			 (pg_strcasecmp(prev5_wd, "CREATE") == 0 &&
+			  (pg_strcasecmp(prev4_wd, "TEMP") == 0 ||
+			   pg_strcasecmp(prev4_wd, "TEMPORARY") == 0) &&
+			  pg_strcasecmp(prev3_wd, "SEQUENCE") == 0)) &&
+			 pg_strcasecmp(prev_wd, "NO") == 0)
+	{
+		static const char *const list_CREATESEQUENCE2[] =
+		{"MINVALUE", "MAXVALUE", "CYCLE", NULL};
+
+		COMPLETE_WITH_LIST(list_CREATESEQUENCE2);
+	}
 
 /* CREATE SERVER <name> */
 	else if (pg_strcasecmp(prev3_wd, "CREATE") == 0 &&
@@ -2381,6 +2639,7 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_views, NULL);
 	/* complete CREATE TRIGGER ... EXECUTE with PROCEDURE */
 	else if (pg_strcasecmp(prev_wd, "EXECUTE") == 0 &&
+			 !(pg_strcasecmp(prev2_wd, "GRANT") == 0 && prev3_wd[0] == '\0') &&
 			 prev2_wd[0] != '\0')
 		COMPLETE_WITH_CONST("PROCEDURE");
 
@@ -2391,11 +2650,12 @@ psql_completion(const char *text, int start, int end)
 			  pg_strcasecmp(prev2_wd, "GROUP") == 0 || pg_strcasecmp(prev2_wd, "USER") == 0))
 	{
 		static const char *const list_CREATEROLE[] =
-		{"ADMIN", "CONNECTION LIMIT", "CREATEDB", "CREATEROLE", "CREATEUSER",
-			"ENCRYPTED", "IN", "INHERIT", "LOGIN", "NOCREATEDB",
-			"NOCREATEROLE", "NOCREATEUSER", "NOINHERIT", "NOLOGIN",
-			"NOREPLICATION", "NOSUPERUSER", "REPLICATION", "ROLE",
-		"SUPERUSER", "SYSID", "UNENCRYPTED", "VALID UNTIL", "WITH", NULL};
+		{"ADMIN", "BYPASSRLS", "CONNECTION LIMIT", "CREATEDB", "CREATEROLE",
+			"CREATEUSER", "ENCRYPTED", "IN", "INHERIT", "LOGIN", "NOBYPASSRLS",
+			"NOCREATEDB", "NOCREATEROLE", "NOCREATEUSER", "NOINHERIT",
+			"NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD",
+			"REPLICATION", "ROLE", "SUPERUSER", "SYSID", "UNENCRYPTED",
+		"VALID UNTIL", "WITH", NULL};
 
 		COMPLETE_WITH_LIST(list_CREATEROLE);
 	}
@@ -2409,11 +2669,12 @@ psql_completion(const char *text, int start, int end)
 	{
 		/* Similar to the above, but don't complete "WITH" again. */
 		static const char *const list_CREATEROLE_WITH[] =
-		{"ADMIN", "CONNECTION LIMIT", "CREATEDB", "CREATEROLE", "CREATEUSER",
-			"ENCRYPTED", "IN", "INHERIT", "LOGIN", "NOCREATEDB",
-			"NOCREATEROLE", "NOCREATEUSER", "NOINHERIT", "NOLOGIN",
-			"NOREPLICATION", "NOSUPERUSER", "REPLICATION", "ROLE",
-		"SUPERUSER", "SYSID", "UNENCRYPTED", "VALID UNTIL", NULL};
+		{"ADMIN", "BYPASSRLS", "CONNECTION LIMIT", "CREATEDB", "CREATEROLE",
+			"CREATEUSER", "ENCRYPTED", "IN", "INHERIT", "LOGIN", "NOBYPASSRLS",
+			"NOCREATEDB", "NOCREATEROLE", "NOCREATEUSER", "NOINHERIT",
+			"NOLOGIN", "NOREPLICATION", "NOSUPERUSER", "PASSWORD",
+			"REPLICATION", "ROLE", "SUPERUSER", "SYSID", "UNENCRYPTED",
+		"VALID UNTIL", NULL};
 
 		COMPLETE_WITH_LIST(list_CREATEROLE_WITH);
 	}
@@ -2692,6 +2953,27 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_QUERY(Query_for_list_of_event_triggers);
 	}
 
+	/* DROP POLICY <name>  */
+	else if (pg_strcasecmp(prev2_wd, "DROP") == 0 &&
+			 pg_strcasecmp(prev_wd, "POLICY") == 0)
+	{
+		COMPLETE_WITH_QUERY(Query_for_list_of_policies);
+	}
+	/* DROP POLICY <name> ON */
+	else if (pg_strcasecmp(prev3_wd, "DROP") == 0 &&
+			 pg_strcasecmp(prev2_wd, "POLICY") == 0)
+	{
+		COMPLETE_WITH_CONST("ON");
+	}
+	/* DROP POLICY <name> ON <table> */
+	else if (pg_strcasecmp(prev4_wd, "DROP") == 0 &&
+			 pg_strcasecmp(prev3_wd, "POLICY") == 0 &&
+			 pg_strcasecmp(prev_wd, "ON") == 0)
+	{
+		completion_info_charp = prev2_wd;
+		COMPLETE_WITH_QUERY(Query_for_list_of_tables_for_policy);
+	}
+
 	/* DROP RULE */
 	else if (pg_strcasecmp(prev3_wd, "DROP") == 0 &&
 			 pg_strcasecmp(prev2_wd, "RULE") == 0)
@@ -2777,9 +3059,8 @@ psql_completion(const char *text, int start, int end)
 	 * but we may as well tab-complete both: perhaps some users prefer one
 	 * variant or the other.
 	 */
-	else if ((pg_strcasecmp(prev3_wd, "FETCH") == 0 ||
-			  pg_strcasecmp(prev3_wd, "MOVE") == 0) &&
-			 pg_strcasecmp(prev_wd, "TO") != 0)
+	else if (pg_strcasecmp(prev3_wd, "FETCH") == 0 ||
+			 pg_strcasecmp(prev3_wd, "MOVE") == 0)
 	{
 		static const char *const list_FROMIN[] =
 		{"FROM", "IN", NULL};
@@ -2800,6 +3081,11 @@ psql_completion(const char *text, int start, int end)
 			 pg_strcasecmp(prev2_wd, "FOREIGN") == 0 &&
 			 pg_strcasecmp(prev_wd, "TABLE") == 0)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_foreign_tables, NULL);
+
+/* FOREIGN SERVER */
+	else if (pg_strcasecmp(prev2_wd, "FOREIGN") == 0 &&
+			 pg_strcasecmp(prev_wd, "SERVER") == 0)
+		COMPLETE_WITH_QUERY(Query_for_list_of_servers);
 
 /* GRANT && REVOKE */
 	/* Complete GRANT/REVOKE with a list of roles and privileges */
@@ -2854,20 +3140,23 @@ psql_completion(const char *text, int start, int end)
 	}
 
 	/*
-	 * Complete GRANT/REVOKE <sth> ON with a list of tables, views, sequences,
-	 * and indexes
+	 * Complete GRANT/REVOKE <sth> ON with a list of tables, views, and
+	 * sequences.
 	 *
-	 * keywords DATABASE, FUNCTION, LANGUAGE, SCHEMA added to query result via
-	 * UNION; seems to work intuitively
+	 * Keywords like DATABASE, FUNCTION, LANGUAGE and SCHEMA added to
+	 * query result via UNION; seems to work intuitively.
 	 *
 	 * Note: GRANT/REVOKE can get quite complex; tab-completion as implemented
 	 * here will only work if the privilege list contains exactly one
-	 * privilege
+	 * privilege.
 	 */
 	else if ((pg_strcasecmp(prev3_wd, "GRANT") == 0 ||
 			  pg_strcasecmp(prev3_wd, "REVOKE") == 0) &&
 			 pg_strcasecmp(prev_wd, "ON") == 0)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tsvmf,
+								   " UNION SELECT 'ALL FUNCTIONS IN SCHEMA'"
+								   " UNION SELECT 'ALL SEQUENCES IN SCHEMA'"
+								   " UNION SELECT 'ALL TABLES IN SCHEMA'"
 								   " UNION SELECT 'DATABASE'"
 								   " UNION SELECT 'DOMAIN'"
 								   " UNION SELECT 'FOREIGN DATA WRAPPER'"
@@ -2876,8 +3165,23 @@ psql_completion(const char *text, int start, int end)
 								   " UNION SELECT 'LANGUAGE'"
 								   " UNION SELECT 'LARGE OBJECT'"
 								   " UNION SELECT 'SCHEMA'"
+								   " UNION SELECT 'SEQUENCE'"
+								   " UNION SELECT 'TABLE'"
 								   " UNION SELECT 'TABLESPACE'"
 								   " UNION SELECT 'TYPE'");
+
+	else if ((pg_strcasecmp(prev4_wd, "GRANT") == 0 ||
+			  pg_strcasecmp(prev4_wd, "REVOKE") == 0) &&
+			 pg_strcasecmp(prev2_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev_wd, "ALL") == 0)
+	{
+		static const char *const list_privilege_all[] =
+		{"FUNCTIONS IN SCHEMA", "SEQUENCES IN SCHEMA", "TABLES IN SCHEMA",
+		 NULL};
+
+		COMPLETE_WITH_LIST(list_privilege_all);
+	}
+
 	else if ((pg_strcasecmp(prev4_wd, "GRANT") == 0 ||
 			  pg_strcasecmp(prev4_wd, "REVOKE") == 0) &&
 			 pg_strcasecmp(prev2_wd, "ON") == 0 &&
@@ -2889,7 +3193,12 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_LIST(list_privilege_foreign);
 	}
 
-	/* Complete "GRANT/REVOKE * ON * " with "TO/FROM" */
+	/*
+	 * Complete "GRANT/REMOVE * ON DATABASE/DOMAIN/..." with a list of
+	 * appropriate objects.
+	 *
+	 * Complete "GRANT/REVOKE * ON * " with "TO/FROM".
+	 */
 	else if ((pg_strcasecmp(prev4_wd, "GRANT") == 0 ||
 			  pg_strcasecmp(prev4_wd, "REVOKE") == 0) &&
 			 pg_strcasecmp(prev2_wd, "ON") == 0)
@@ -2904,6 +3213,10 @@ psql_completion(const char *text, int start, int end)
 			COMPLETE_WITH_QUERY(Query_for_list_of_languages);
 		else if (pg_strcasecmp(prev_wd, "SCHEMA") == 0)
 			COMPLETE_WITH_QUERY(Query_for_list_of_schemas);
+		else if (pg_strcasecmp(prev_wd, "SEQUENCE") == 0)
+			COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_sequences, NULL);
+		else if (pg_strcasecmp(prev_wd, "TABLE") == 0)
+			COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tsvmf, NULL);
 		else if (pg_strcasecmp(prev_wd, "TABLESPACE") == 0)
 			COMPLETE_WITH_QUERY(Query_for_list_of_tablespaces);
 		else if (pg_strcasecmp(prev_wd, "TYPE") == 0)
@@ -2914,25 +3227,78 @@ psql_completion(const char *text, int start, int end)
 			COMPLETE_WITH_CONST("FROM");
 	}
 
-	/* Complete "GRANT/REVOKE * ON * TO/FROM" with username, GROUP, or PUBLIC */
+	/* Complete "GRANT/REVOKE * ON * *" with TO/FROM */
 	else if (pg_strcasecmp(prev5_wd, "GRANT") == 0 &&
 			 pg_strcasecmp(prev3_wd, "ON") == 0)
-	{
-		if (pg_strcasecmp(prev_wd, "TO") == 0)
-			COMPLETE_WITH_QUERY(Query_for_list_of_grant_roles);
-		else
-			COMPLETE_WITH_CONST("TO");
-	}
+		COMPLETE_WITH_CONST("TO");
+
 	else if (pg_strcasecmp(prev5_wd, "REVOKE") == 0 &&
 			 pg_strcasecmp(prev3_wd, "ON") == 0)
+		COMPLETE_WITH_CONST("FROM");
+
+	/* Complete "GRANT/REVOKE * ON ALL * IN SCHEMA *" with TO/FROM */
+	else if ((pg_strcasecmp(prev8_wd, "GRANT") == 0 ||
+			  pg_strcasecmp(prev8_wd, "REVOKE") == 0) &&
+			 pg_strcasecmp(prev6_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev5_wd, "ALL") == 0 &&
+			 pg_strcasecmp(prev3_wd, "IN") == 0 &&
+			 pg_strcasecmp(prev2_wd, "SCHEMA") == 0)
 	{
-		if (pg_strcasecmp(prev_wd, "FROM") == 0)
-			COMPLETE_WITH_QUERY(Query_for_list_of_grant_roles);
+		if (pg_strcasecmp(prev8_wd, "GRANT") == 0)
+			COMPLETE_WITH_CONST("TO");
 		else
 			COMPLETE_WITH_CONST("FROM");
 	}
 
-	/* Complete "GRANT/REVOKE * TO/FROM" with username, GROUP, or PUBLIC */
+	/* Complete "GRANT/REVOKE * ON FOREIGN DATA WRAPPER *" with TO/FROM */
+	else if ((pg_strcasecmp(prev7_wd, "GRANT") == 0 ||
+			  pg_strcasecmp(prev7_wd, "REVOKE") == 0) &&
+			 pg_strcasecmp(prev5_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev4_wd, "FOREIGN") == 0 &&
+			 pg_strcasecmp(prev3_wd, "DATA") == 0 &&
+			 pg_strcasecmp(prev2_wd, "WRAPPER") == 0)
+	{
+		if (pg_strcasecmp(prev7_wd, "GRANT") == 0)
+			COMPLETE_WITH_CONST("TO");
+		else
+			COMPLETE_WITH_CONST("FROM");
+	}
+
+	/* Complete "GRANT/REVOKE * ON FOREIGN SERVER *" with TO/FROM */
+	else if ((pg_strcasecmp(prev6_wd, "GRANT") == 0 ||
+			  pg_strcasecmp(prev6_wd, "REVOKE") == 0) &&
+			 pg_strcasecmp(prev4_wd, "ON") == 0 &&
+			 pg_strcasecmp(prev3_wd, "FOREIGN") == 0 &&
+			 pg_strcasecmp(prev2_wd, "SERVER") == 0)
+	{
+		if (pg_strcasecmp(prev6_wd, "GRANT") == 0)
+			COMPLETE_WITH_CONST("TO");
+		else
+			COMPLETE_WITH_CONST("FROM");
+	}
+
+	/*
+	 * Complete "GRANT/REVOKE ... TO/FROM" with username, PUBLIC,
+	 * CURRENT_USER, or SESSION_USER.
+	 */
+	else if (((pg_strcasecmp(prev9_wd, "GRANT") == 0 ||
+			   pg_strcasecmp(prev8_wd, "GRANT") == 0 ||
+			   pg_strcasecmp(prev7_wd, "GRANT") == 0 ||
+			   pg_strcasecmp(prev6_wd, "GRANT") == 0 ||
+			   pg_strcasecmp(prev5_wd, "GRANT") == 0) &&
+			  pg_strcasecmp(prev_wd, "TO") == 0) ||
+			 ((pg_strcasecmp(prev9_wd, "REVOKE") == 0 ||
+			   pg_strcasecmp(prev8_wd, "REVOKE") == 0 ||
+			   pg_strcasecmp(prev7_wd, "REVOKE") == 0 ||
+			   pg_strcasecmp(prev6_wd, "REVOKE") == 0 ||
+			   pg_strcasecmp(prev5_wd, "REVOKE") == 0) &&
+			  pg_strcasecmp(prev_wd, "FROM") == 0))
+		COMPLETE_WITH_QUERY(Query_for_list_of_grant_roles);
+
+	/*
+	 * Complete "GRANT/REVOKE * TO/FROM" with username, PUBLIC,
+	 * CURRENT_USER, or SESSION_USER.
+	 */
 	else if (pg_strcasecmp(prev3_wd, "GRANT") == 0 &&
 			 pg_strcasecmp(prev_wd, "TO") == 0)
 	{
@@ -3145,7 +3511,7 @@ psql_completion(const char *text, int start, int end)
 	else if (pg_strcasecmp(prev_wd, "REINDEX") == 0)
 	{
 		static const char *const list_REINDEX[] =
-		{"TABLE", "INDEX", "SYSTEM", "DATABASE", NULL};
+		{"TABLE", "INDEX", "SYSTEM", "SCHEMA", "DATABASE", NULL};
 
 		COMPLETE_WITH_LIST(list_REINDEX);
 	}
@@ -3155,6 +3521,8 @@ psql_completion(const char *text, int start, int end)
 			COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tm, NULL);
 		else if (pg_strcasecmp(prev_wd, "INDEX") == 0)
 			COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes, NULL);
+		else if (pg_strcasecmp(prev_wd, "SCHEMA") == 0)
+			COMPLETE_WITH_QUERY(Query_for_list_of_schemas);
 		else if (pg_strcasecmp(prev_wd, "SYSTEM") == 0 ||
 				 pg_strcasecmp(prev_wd, "DATABASE") == 0)
 			COMPLETE_WITH_QUERY(Query_for_list_of_databases);
@@ -3328,6 +3696,7 @@ psql_completion(const char *text, int start, int end)
 	else if (pg_strcasecmp(prev3_wd, "SET") == 0 &&
 			 (pg_strcasecmp(prev_wd, "TO") == 0 || strcmp(prev_wd, "=") == 0))
 	{
+		/* special cased code for individual GUCs */
 		if (pg_strcasecmp(prev2_wd, "DateStyle") == 0)
 		{
 			static const char *const my_list[] =
@@ -3335,20 +3704,6 @@ psql_completion(const char *text, int start, int end)
 				"YMD", "DMY", "MDY",
 				"US", "European", "NonEuropean",
 			"DEFAULT", NULL};
-
-			COMPLETE_WITH_LIST(my_list);
-		}
-		else if (pg_strcasecmp(prev2_wd, "IntervalStyle") == 0)
-		{
-			static const char *const my_list[] =
-			{"postgres", "postgres_verbose", "sql_standard", "iso_8601", NULL};
-
-			COMPLETE_WITH_LIST(my_list);
-		}
-		else if (pg_strcasecmp(prev2_wd, "GEQO") == 0)
-		{
-			static const char *const my_list[] =
-			{"ON", "OFF", "DEFAULT", NULL};
 
 			COMPLETE_WITH_LIST(my_list);
 		}
@@ -3361,10 +3716,34 @@ psql_completion(const char *text, int start, int end)
 		}
 		else
 		{
-			static const char *const my_list[] =
-			{"DEFAULT", NULL};
+			/* generic, type based, GUC support */
 
-			COMPLETE_WITH_LIST(my_list);
+			char	   *guctype = get_guctype(prev2_wd);
+
+			if (guctype && strcmp(guctype, "enum") == 0)
+			{
+				char		querybuf[1024];
+
+				snprintf(querybuf, 1024, Query_for_enum, prev2_wd);
+				COMPLETE_WITH_QUERY(querybuf);
+			}
+			else if (guctype && strcmp(guctype, "bool") == 0)
+			{
+				static const char *const my_list[] =
+				{"on", "off", "true", "false", "yes", "no", "1", "0", "DEFAULT", NULL};
+
+				COMPLETE_WITH_LIST(my_list);
+			}
+			else
+			{
+				static const char *const my_list[] =
+				{"DEFAULT", NULL};
+
+				COMPLETE_WITH_LIST(my_list);
+			}
+
+			if (guctype)
+				free(guctype);
 		}
 	}
 
@@ -3376,6 +3755,13 @@ psql_completion(const char *text, int start, int end)
 	else if (pg_strcasecmp(prev_wd, "TABLE") == 0 &&
 			 prev2_wd[0] == '\0')
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_relations, NULL);
+
+/* TABLESAMPLE */
+	else if (pg_strcasecmp(prev_wd, "TABLESAMPLE") == 0)
+		COMPLETE_WITH_QUERY(Query_for_list_of_tablesample_methods);
+
+	else if (pg_strcasecmp(prev2_wd, "TABLESAMPLE") == 0)
+		COMPLETE_WITH_CONST("(");
 
 /* TRUNCATE */
 	else if (pg_strcasecmp(prev_wd, "TRUNCATE") == 0)
@@ -3510,9 +3896,23 @@ psql_completion(const char *text, int start, int end)
 
 /* Backslash commands */
 /* TODO:  \dc \dd \dl */
-	else if (strcmp(prev_wd, "\\connect") == 0 || strcmp(prev_wd, "\\c") == 0)
-		COMPLETE_WITH_QUERY(Query_for_list_of_databases);
+	else if (strcmp(prev_wd, "\\?") == 0)
+	{
+		static const char *const my_list[] =
+		{"commands", "options", "variables", NULL};
 
+		COMPLETE_WITH_LIST_CS(my_list);
+	}
+	else if (strcmp(prev_wd, "\\connect") == 0 || strcmp(prev_wd, "\\c") == 0)
+	{
+		if (!recognized_connection_string(text))
+			COMPLETE_WITH_QUERY(Query_for_list_of_databases);
+	}
+	else if (strcmp(prev2_wd, "\\connect") == 0 || strcmp(prev2_wd, "\\c") == 0)
+	{
+		if (!recognized_connection_string(prev_wd))
+			COMPLETE_WITH_QUERY(Query_for_list_of_roles);
+	}
 	else if (strncmp(prev_wd, "\\da", strlen("\\da")) == 0)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_aggregates, NULL);
 	else if (strncmp(prev_wd, "\\db", strlen("\\db")) == 0)
@@ -3562,6 +3962,10 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_QUERY(Query_for_list_of_extensions);
 	else if (strncmp(prev_wd, "\\dm", strlen("\\dm")) == 0)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_matviews, NULL);
+	else if (strncmp(prev_wd, "\\dE", strlen("\\dE")) == 0)
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_foreign_tables, NULL);
+	else if (strncmp(prev_wd, "\\dy", strlen("\\dy")) == 0)
+		COMPLETE_WITH_QUERY(Query_for_list_of_event_triggers);
 
 	/* must be at end of \d list */
 	else if (strncmp(prev_wd, "\\d", strlen("\\d")) == 0)
@@ -3569,6 +3973,8 @@ psql_completion(const char *text, int start, int end)
 
 	else if (strcmp(prev_wd, "\\ef") == 0)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_functions, NULL);
+	else if (strcmp(prev_wd, "\\ev") == 0)
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_views, NULL);
 
 	else if (strcmp(prev_wd, "\\encoding") == 0)
 		COMPLETE_WITH_QUERY(Query_for_list_of_encodings);
@@ -3582,7 +3988,8 @@ psql_completion(const char *text, int start, int end)
 		{"border", "columns", "expanded", "fieldsep", "fieldsep_zero",
 			"footer", "format", "linestyle", "null", "numericlocale",
 			"pager", "recordsep", "recordsep_zero", "tableattr", "title",
-		"tuples_only", NULL};
+			"tuples_only", "unicode_border_linestyle",
+		"unicode_column_linestyle", "unicode_header_linestyle", NULL};
 
 		COMPLETE_WITH_LIST_CS(my_list);
 	}
@@ -3591,8 +3998,8 @@ psql_completion(const char *text, int start, int end)
 		if (strcmp(prev_wd, "format") == 0)
 		{
 			static const char *const my_list[] =
-			{"unaligned", "aligned", "wrapped", "html", "latex",
-			"troff-ms", NULL};
+			{"unaligned", "aligned", "wrapped", "html", "asciidoc",
+			"latex", "latex-longtable", "troff-ms", NULL};
 
 			COMPLETE_WITH_LIST_CS(my_list);
 		}
@@ -3603,13 +4010,94 @@ psql_completion(const char *text, int start, int end)
 
 			COMPLETE_WITH_LIST_CS(my_list);
 		}
+		else if (strcmp(prev_wd, "unicode_border_linestyle") == 0 ||
+				 strcmp(prev_wd, "unicode_column_linestyle") == 0 ||
+				 strcmp(prev_wd, "unicode_header_linestyle") == 0)
+		{
+			static const char *const my_list[] =
+			{"single", "double", NULL};
+
+			COMPLETE_WITH_LIST_CS(my_list);
+
+		}
+	}
+	else if (strcmp(prev_wd, "\\unset") == 0)
+	{
+		matches = complete_from_variables(text, "", "", true);
 	}
 	else if (strcmp(prev_wd, "\\set") == 0)
 	{
-		matches = complete_from_variables(text, "", "");
+		matches = complete_from_variables(text, "", "", false);
+	}
+	else if (strcmp(prev2_wd, "\\set") == 0)
+	{
+		static const char *const boolean_value_list[] =
+		{"on", "off", NULL};
+
+		if (strcmp(prev_wd, "AUTOCOMMIT") == 0)
+			COMPLETE_WITH_LIST_CS(boolean_value_list);
+		else if (strcmp(prev_wd, "COMP_KEYWORD_CASE") == 0)
+		{
+			static const char *const my_list[] =
+			{"lower", "upper", "preserve-lower", "preserve-upper", NULL};
+
+			COMPLETE_WITH_LIST_CS(my_list);
+		}
+		else if (strcmp(prev_wd, "ECHO") == 0)
+		{
+			static const char *const my_list[] =
+			{"errors", "queries", "all", "none", NULL};
+
+			COMPLETE_WITH_LIST_CS(my_list);
+		}
+		else if (strcmp(prev_wd, "ECHO_HIDDEN") == 0)
+		{
+			static const char *const my_list[] =
+			{"noexec", "off", "on", NULL};
+
+			COMPLETE_WITH_LIST_CS(my_list);
+		}
+		else if (strcmp(prev_wd, "HISTCONTROL") == 0)
+		{
+			static const char *const my_list[] =
+			{"ignorespace", "ignoredups", "ignoreboth", "none", NULL};
+
+			COMPLETE_WITH_LIST_CS(my_list);
+		}
+		else if (strcmp(prev_wd, "ON_ERROR_ROLLBACK") == 0)
+		{
+			static const char *const my_list[] =
+			{"on", "off", "interactive", NULL};
+
+			COMPLETE_WITH_LIST_CS(my_list);
+		}
+		else if (strcmp(prev_wd, "ON_ERROR_STOP") == 0)
+			COMPLETE_WITH_LIST_CS(boolean_value_list);
+		else if (strcmp(prev_wd, "QUIET") == 0)
+			COMPLETE_WITH_LIST_CS(boolean_value_list);
+		else if (strcmp(prev_wd, "SHOW_CONTEXT") == 0)
+		{
+			static const char *const my_list[] =
+			{"never", "errors", "always", NULL};
+
+			COMPLETE_WITH_LIST_CS(my_list);
+		}
+		else if (strcmp(prev_wd, "SINGLELINE") == 0)
+			COMPLETE_WITH_LIST_CS(boolean_value_list);
+		else if (strcmp(prev_wd, "SINGLESTEP") == 0)
+			COMPLETE_WITH_LIST_CS(boolean_value_list);
+		else if (strcmp(prev_wd, "VERBOSITY") == 0)
+		{
+			static const char *const my_list[] =
+			{"default", "verbose", "terse", NULL};
+
+			COMPLETE_WITH_LIST_CS(my_list);
+		}
 	}
 	else if (strcmp(prev_wd, "\\sf") == 0 || strcmp(prev_wd, "\\sf+") == 0)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_functions, NULL);
+	else if (strcmp(prev_wd, "\\sv") == 0 || strcmp(prev_wd, "\\sv+") == 0)
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_views, NULL);
 	else if (strcmp(prev_wd, "\\cd") == 0 ||
 			 strcmp(prev_wd, "\\e") == 0 || strcmp(prev_wd, "\\edit") == 0 ||
 			 strcmp(prev_wd, "\\g") == 0 ||
@@ -3798,30 +4286,15 @@ _complete_from_query(int is_schema_query, const char *text, int state)
 		result = NULL;
 
 		/* Set up suitably-escaped copies of textual inputs */
-		e_text = pg_malloc(string_length * 2 + 1);
-		PQescapeString(e_text, text, string_length);
+		e_text = escape_string(text);
 
 		if (completion_info_charp)
-		{
-			size_t		charp_len;
-
-			charp_len = strlen(completion_info_charp);
-			e_info_charp = pg_malloc(charp_len * 2 + 1);
-			PQescapeString(e_info_charp, completion_info_charp,
-						   charp_len);
-		}
+			e_info_charp = escape_string(completion_info_charp);
 		else
 			e_info_charp = NULL;
 
 		if (completion_info_charp2)
-		{
-			size_t		charp_len;
-
-			charp_len = strlen(completion_info_charp2);
-			e_info_charp2 = pg_malloc(charp_len * 2 + 1);
-			PQescapeString(e_info_charp2, completion_info_charp2,
-						   charp_len);
-		}
+			e_info_charp2 = escape_string(completion_info_charp2);
 		else
 			e_info_charp2 = NULL;
 
@@ -4053,12 +4526,34 @@ complete_from_const(const char *text, int state)
 
 
 /*
+ * This function appends the variable name with prefix and suffix to
+ * the variable names array.
+ */
+static void
+append_variable_names(char ***varnames, int *nvars,
+					  int *maxvars, const char *varname,
+					  const char *prefix, const char *suffix)
+{
+	if (*nvars >= *maxvars)
+	{
+		*maxvars *= 2;
+		*varnames = (char **) pg_realloc(*varnames,
+										 ((*maxvars) + 1) * sizeof(char *));
+	}
+
+	(*varnames)[(*nvars)++] = psprintf("%s%s%s", prefix, varname, suffix);
+}
+
+
+/*
  * This function supports completion with the name of a psql variable.
  * The variable names can be prefixed and suffixed with additional text
- * to support quoting usages.
+ * to support quoting usages. If need_value is true, only the variables
+ * that have the set values are picked up.
  */
 static char **
-complete_from_variables(const char *text, const char *prefix, const char *suffix)
+complete_from_variables(const char *text, const char *prefix, const char *suffix,
+						bool need_value)
 {
 	char	  **matches;
 	char	  **varnames;
@@ -4067,23 +4562,35 @@ complete_from_variables(const char *text, const char *prefix, const char *suffix
 	int			i;
 	struct _variable *ptr;
 
+	static const char *const known_varnames[] = {
+		"AUTOCOMMIT", "COMP_KEYWORD_CASE", "DBNAME", "ECHO", "ECHO_HIDDEN",
+		"ENCODING", "FETCH_COUNT", "HISTCONTROL", "HISTFILE", "HISTSIZE",
+		"HOST", "IGNOREEOF", "LASTOID", "ON_ERROR_ROLLBACK", "ON_ERROR_STOP",
+		"PORT", "PROMPT1", "PROMPT2", "PROMPT3", "QUIET",
+		"SHOW_CONTEXT", "SINGLELINE", "SINGLESTEP",
+		"USER", "VERBOSITY", NULL
+	};
+
 	varnames = (char **) pg_malloc((maxvars + 1) * sizeof(char *));
+
+	if (!need_value)
+	{
+		for (i = 0; known_varnames[i] && nvars < maxvars; i++)
+			append_variable_names(&varnames, &nvars, &maxvars,
+								  known_varnames[i], prefix, suffix);
+	}
 
 	for (ptr = pset.vars->next; ptr; ptr = ptr->next)
 	{
-		if (nvars >= maxvars)
+		if (need_value && !(ptr->value))
+			continue;
+		for (i = 0; known_varnames[i]; i++)		/* remove duplicate entry */
 		{
-			maxvars *= 2;
-			varnames = (char **) realloc(varnames,
-										 (maxvars + 1) * sizeof(char *));
-			if (!varnames)
-			{
-				psql_error("out of memory\n");
-				exit(EXIT_FAILURE);
-			}
+			if (strcmp(ptr->name, known_varnames[i]) == 0)
+				continue;
 		}
-
-		varnames[nvars++] = psprintf("%s%s%s", prefix, ptr->name, suffix);
+		append_variable_names(&varnames, &nvars, &maxvars, ptr->name,
+							  prefix, suffix);
 	}
 
 	varnames[nvars] = NULL;
@@ -4149,7 +4656,7 @@ complete_from_files(const char *text, int state)
 
 /*
  * Make a pg_strdup copy of s and convert the case according to
- * COMP_KEYWORD_CASE variable, using ref as the text that was already entered.
+ * COMP_KEYWORD_CASE setting, using ref as the text that was already entered.
  */
 static char *
 pg_strdup_keyword_case(const char *s, const char *ref)
@@ -4157,40 +4664,44 @@ pg_strdup_keyword_case(const char *s, const char *ref)
 	char	   *ret,
 			   *p;
 	unsigned char first = ref[0];
-	int			tocase;
-	const char *varval;
-
-	varval = GetVariable(pset.vars, "COMP_KEYWORD_CASE");
-	if (!varval)
-		tocase = 0;
-	else if (strcmp(varval, "lower") == 0)
-		tocase = -2;
-	else if (strcmp(varval, "preserve-lower") == 0)
-		tocase = -1;
-	else if (strcmp(varval, "preserve-upper") == 0)
-		tocase = +1;
-	else if (strcmp(varval, "upper") == 0)
-		tocase = +2;
-	else
-		tocase = 0;
-
-	/* default */
-	if (tocase == 0)
-		tocase = +1;
 
 	ret = pg_strdup(s);
 
-	if (tocase == -2
-		|| ((tocase == -1 || tocase == +1) && islower(first))
-		|| (tocase == -1 && !isalpha(first))
-		)
+	if (pset.comp_case == PSQL_COMP_CASE_LOWER ||
+		((pset.comp_case == PSQL_COMP_CASE_PRESERVE_LOWER ||
+	   pset.comp_case == PSQL_COMP_CASE_PRESERVE_UPPER) && islower(first)) ||
+		(pset.comp_case == PSQL_COMP_CASE_PRESERVE_LOWER && !isalpha(first)))
+	{
 		for (p = ret; *p; p++)
 			*p = pg_tolower((unsigned char) *p);
+	}
 	else
+	{
 		for (p = ret; *p; p++)
 			*p = pg_toupper((unsigned char) *p);
+	}
 
 	return ret;
+}
+
+
+/*
+ * escape_string - Escape argument for use as string literal.
+ *
+ * The returned value has to be freed.
+ */
+static char *
+escape_string(const char *text)
+{
+	size_t		text_length;
+	char	   *result;
+
+	text_length = strlen(text);
+
+	result = pg_malloc(text_length * 2 + 1);
+	PQescapeStringConn(pset.db, result, text, text_length, NULL);
+
+	return result;
 }
 
 
@@ -4305,6 +4816,40 @@ get_previous_words(int point, char **previous_words, int nwords)
 
 		*previous_words++ = s;
 	}
+}
+
+/*
+ * Look up the type for the GUC variable with the passed name.
+ *
+ * Returns NULL if the variable is unknown. Otherwise the returned string,
+ * containing the type, has to be freed.
+ */
+static char *
+get_guctype(const char *varname)
+{
+	PQExpBufferData query_buffer;
+	char	   *e_varname;
+	PGresult   *result;
+	char	   *guctype = NULL;
+
+	e_varname = escape_string(varname);
+
+	initPQExpBuffer(&query_buffer);
+	appendPQExpBuffer(&query_buffer,
+					  "SELECT vartype FROM pg_catalog.pg_settings "
+					  "WHERE pg_catalog.lower(name) = pg_catalog.lower('%s')",
+					  e_varname);
+
+	result = exec_query(query_buffer.data);
+	termPQExpBuffer(&query_buffer);
+	free(e_varname);
+
+	if (PQresultStatus(result) == PGRES_TUPLES_OK && PQntuples(result) > 0)
+		guctype = pg_strdup(PQgetvalue(result, 0, 0));
+
+	PQclear(result);
+
+	return guctype;
 }
 
 #ifdef NOT_USED

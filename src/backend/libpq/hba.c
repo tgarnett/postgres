@@ -5,7 +5,7 @@
  *	  wherein you authenticate a user by seeing what IP address the system
  *	  says he comes from and choosing authentication method based on it).
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -386,7 +386,7 @@ tokenize_file(const char *filename, FILE *file,
 	MemoryContext linecxt;
 	MemoryContext oldcxt;
 
-	linecxt = AllocSetContextCreate(TopMemoryContext,
+	linecxt = AllocSetContextCreate(CurrentMemoryContext,
 									"tokenize file cxt",
 									ALLOCSET_DEFAULT_MINSIZE,
 									ALLOCSET_DEFAULT_INITSIZE,
@@ -680,42 +680,12 @@ check_hostname(hbaPort *port, const char *hostname)
 static bool
 check_ip(SockAddr *raddr, struct sockaddr * addr, struct sockaddr * mask)
 {
-	if (raddr->addr.ss_family == addr->sa_family)
-	{
-		/* Same address family */
-		if (!pg_range_sockaddr(&raddr->addr,
-							   (struct sockaddr_storage *) addr,
-							   (struct sockaddr_storage *) mask))
-			return false;
-	}
-#ifdef HAVE_IPV6
-	else if (addr->sa_family == AF_INET &&
-			 raddr->addr.ss_family == AF_INET6)
-	{
-		/*
-		 * If we're connected on IPv6 but the file specifies an IPv4 address
-		 * to match against, promote the latter to an IPv6 address before
-		 * trying to match the client's address.
-		 */
-		struct sockaddr_storage addrcopy,
-					maskcopy;
-
-		memcpy(&addrcopy, &addr, sizeof(addrcopy));
-		memcpy(&maskcopy, &mask, sizeof(maskcopy));
-		pg_promote_v4_to_v6_addr(&addrcopy);
-		pg_promote_v4_to_v6_mask(&maskcopy);
-
-		if (!pg_range_sockaddr(&raddr->addr, &addrcopy, &maskcopy))
-			return false;
-	}
-#endif   /* HAVE_IPV6 */
-	else
-	{
-		/* Wrong address family, no IPV6 */
-		return false;
-	}
-
-	return true;
+	if (raddr->addr.ss_family == addr->sa_family &&
+		pg_range_sockaddr(&raddr->addr,
+						  (struct sockaddr_storage *) addr,
+						  (struct sockaddr_storage *) mask))
+		return true;
+	return false;
 }
 
 /*
@@ -925,15 +895,13 @@ parse_hba_line(List *line, int line_num, char *raw_line)
 			return NULL;
 #endif
 		}
-#ifdef USE_SSL
 		else if (token->string[4] == 'n')		/* "hostnossl" */
 		{
 			parsedline->conntype = ctHostNoSSL;
 		}
-#endif
 		else
 		{
-			/* "host", or "hostnossl" and SSL support not built in */
+			/* "host" */
 			parsedline->conntype = ctHost;
 		}
 	}							/* record type */
@@ -1408,6 +1376,19 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline, int line_num)
 	hbaline->ldapscope = LDAP_SCOPE_SUBTREE;
 #endif
 
+	/*
+	 * For GSS and SSPI, set the default value of include_realm to true.
+	 * Having include_realm set to false is dangerous in multi-realm
+	 * situations and is generally considered bad practice.  We keep the
+	 * capability around for backwards compatibility, but we might want to
+	 * remove it at some point in the future.  Users who still need to strip
+	 * the realm off would be better served by using an appropriate regex in a
+	 * pg_ident.conf mapping.
+	 */
+	if (hbaline->auth_method == uaGSS ||
+		hbaline->auth_method == uaSSPI)
+		hbaline->include_realm = true;
+
 	if (strcmp(name, "map") == 0)
 	{
 		if (hbaline->auth_method != uaIdent &&
@@ -1440,7 +1421,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline, int line_num)
 				ereport(LOG,
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
 						 errmsg("client certificates can only be checked if a root certificate store is available"),
-						 errhint("Make sure the configuration parameter \"ssl_ca_file\" is set."),
+						 errhint("Make sure the configuration parameter \"%s\" is set.", "ssl_ca_file"),
 						 errcontext("line %d of configuration file \"%s\"",
 									line_num, HbaFileName)));
 				return false;
@@ -1684,8 +1665,7 @@ check_hba(hbaPort *port)
 				continue;
 
 			/* Check SSL state */
-#ifdef USE_SSL
-			if (port->ssl)
+			if (port->ssl_in_use)
 			{
 				/* Connection is SSL, match both "host" and "hostssl" */
 				if (hba->conntype == ctHostNoSSL)
@@ -1697,11 +1677,6 @@ check_hba(hbaPort *port)
 				if (hba->conntype == ctHostSSL)
 					continue;
 			}
-#else
-			/* No SSL support, so reject "hostssl" lines */
-			if (hba->conntype == ctHostSSL)
-				continue;
-#endif
 
 			/* Check IP address */
 			switch (hba->ip_cmp_method)
@@ -1795,7 +1770,8 @@ load_hba(void)
 	FreeFile(file);
 
 	/* Now parse all the lines */
-	hbacxt = AllocSetContextCreate(TopMemoryContext,
+	Assert(PostmasterContext);
+	hbacxt = AllocSetContextCreate(PostmasterContext,
 								   "hba parser context",
 								   ALLOCSET_DEFAULT_MINSIZE,
 								   ALLOCSET_DEFAULT_MINSIZE,
@@ -2004,6 +1980,8 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 
 		if ((ofs = strstr(identLine->pg_role, "\\1")) != NULL)
 		{
+			int			offset;
+
 			/* substitution of the first argument requested */
 			if (matches[1].rm_so < 0)
 			{
@@ -2020,8 +1998,9 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 			 * plus null terminator
 			 */
 			regexp_pgrole = palloc0(strlen(identLine->pg_role) - 2 + (matches[1].rm_eo - matches[1].rm_so) + 1);
-			strncpy(regexp_pgrole, identLine->pg_role, (ofs - identLine->pg_role));
-			memcpy(regexp_pgrole + strlen(regexp_pgrole),
+			offset = ofs - identLine->pg_role;
+			memcpy(regexp_pgrole, identLine->pg_role, offset);
+			memcpy(regexp_pgrole + offset,
 				   ident_user + matches[1].rm_so,
 				   matches[1].rm_eo - matches[1].rm_so);
 			strcat(regexp_pgrole, ofs + 2);
@@ -2169,7 +2148,8 @@ load_ident(void)
 	FreeFile(file);
 
 	/* Now parse all the lines */
-	ident_context = AllocSetContextCreate(TopMemoryContext,
+	Assert(PostmasterContext);
+	ident_context = AllocSetContextCreate(PostmasterContext,
 										  "ident parser context",
 										  ALLOCSET_DEFAULT_MINSIZE,
 										  ALLOCSET_DEFAULT_MINSIZE,

@@ -3,7 +3,7 @@
  * pl_comp.c		- Compiler part of the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -42,7 +42,7 @@ PLpgSQL_stmt_block *plpgsql_parse_result;
 static int	datums_alloc;
 int			plpgsql_nDatums;
 PLpgSQL_datum **plpgsql_Datums;
-static int	datums_last = 0;
+static int	datums_last;
 
 char	   *plpgsql_error_funcname;
 bool		plpgsql_DumpExecTree = false;
@@ -104,6 +104,8 @@ static Node *make_datum_param(PLpgSQL_expr *expr, int dno, int location);
 static PLpgSQL_row *build_row_from_class(Oid classOid);
 static PLpgSQL_row *build_row_from_vars(PLpgSQL_variable **vars, int numvars);
 static PLpgSQL_type *build_datatype(HeapTuple typeTup, int32 typmod, Oid collation);
+static void plpgsql_start_datums(void);
+static void plpgsql_finish_datums(PLpgSQL_function *function);
 static void compute_function_hashkey(FunctionCallInfo fcinfo,
 						 Form_pg_proc procStruct,
 						 PLpgSQL_func_hashkey *hashkey,
@@ -369,15 +371,9 @@ do_compile(FunctionCallInfo fcinfo,
 	 * variables (such as FOUND), and is named after the function itself.
 	 */
 	plpgsql_ns_init();
-	plpgsql_ns_push(NameStr(procStruct->proname));
+	plpgsql_ns_push(NameStr(procStruct->proname), PLPGSQL_LABEL_BLOCK);
 	plpgsql_DumpExecTree = false;
-
-	datums_alloc = 128;
-	plpgsql_nDatums = 0;
-	/* This is short-lived, so needn't allocate in function's cxt */
-	plpgsql_Datums = MemoryContextAlloc(compile_tmp_cxt,
-									 sizeof(PLpgSQL_datum *) * datums_alloc);
-	datums_last = 0;
+	plpgsql_start_datums();
 
 	switch (function->fn_is_trigger)
 	{
@@ -559,8 +555,6 @@ do_compile(FunctionCallInfo fcinfo,
 			{
 				function->fn_retbyval = typeStruct->typbyval;
 				function->fn_rettyplen = typeStruct->typlen;
-				function->fn_rettypioparam = getTypeIOParam(typeTup);
-				fmgr_info(typeStruct->typinput, &(function->fn_retinput));
 
 				/*
 				 * install $0 reference, but only for polymorphic return
@@ -760,10 +754,8 @@ do_compile(FunctionCallInfo fcinfo,
 	function->fn_nargs = procStruct->pronargs;
 	for (i = 0; i < function->fn_nargs; i++)
 		function->fn_argvarnos[i] = in_arg_varnos[i];
-	function->ndatums = plpgsql_nDatums;
-	function->datums = palloc(sizeof(PLpgSQL_datum *) * plpgsql_nDatums);
-	for (i = 0; i < plpgsql_nDatums; i++)
-		function->datums[i] = plpgsql_Datums[i];
+
+	plpgsql_finish_datums(function);
 
 	/* Debug dump for completed functions */
 	if (plpgsql_DumpExecTree)
@@ -803,11 +795,9 @@ plpgsql_compile_inline(char *proc_source)
 	char	   *func_name = "inline_code_block";
 	PLpgSQL_function *function;
 	ErrorContextCallback plerrcontext;
-	Oid			typinput;
 	PLpgSQL_variable *var;
 	int			parse_rc;
 	MemoryContext func_cxt;
-	int			i;
 
 	/*
 	 * Setup the scanner input and error info.  We assume that this function
@@ -861,13 +851,9 @@ plpgsql_compile_inline(char *proc_source)
 	function->extra_errors = 0;
 
 	plpgsql_ns_init();
-	plpgsql_ns_push(func_name);
+	plpgsql_ns_push(func_name, PLPGSQL_LABEL_BLOCK);
 	plpgsql_DumpExecTree = false;
-
-	datums_alloc = 128;
-	plpgsql_nDatums = 0;
-	plpgsql_Datums = palloc(sizeof(PLpgSQL_datum *) * datums_alloc);
-	datums_last = 0;
+	plpgsql_start_datums();
 
 	/* Set up as though in a function returning VOID */
 	function->fn_rettype = VOIDOID;
@@ -876,8 +862,6 @@ plpgsql_compile_inline(char *proc_source)
 	/* a bit of hardwired knowledge about type VOID here */
 	function->fn_retbyval = true;
 	function->fn_rettyplen = sizeof(int32);
-	getTypeInputInfo(VOIDOID, &typinput, &function->fn_rettypioparam);
-	fmgr_info(typinput, &(function->fn_retinput));
 
 	/*
 	 * Remember if function is STABLE/IMMUTABLE.  XXX would it be better to
@@ -916,10 +900,8 @@ plpgsql_compile_inline(char *proc_source)
 	 * Complete the function's info
 	 */
 	function->fn_nargs = 0;
-	function->ndatums = plpgsql_nDatums;
-	function->datums = palloc(sizeof(PLpgSQL_datum *) * plpgsql_nDatums);
-	for (i = 0; i < plpgsql_nDatums; i++)
-		function->datums[i] = plpgsql_Datums[i];
+
+	plpgsql_finish_datums(function);
 
 	/*
 	 * Pop the error context stack
@@ -1970,6 +1952,7 @@ plpgsql_build_record(const char *refname, int lineno, bool add2namespace)
 	rec->tup = NULL;
 	rec->tupdesc = NULL;
 	rec->freetup = false;
+	rec->freetupdesc = false;
 	plpgsql_adddatum((PLpgSQL_datum *) rec);
 	if (add2namespace)
 		plpgsql_ns_additem(PLPGSQL_NSTYPE_REC, rec->dno, rec->refname);
@@ -2200,12 +2183,27 @@ build_datatype(HeapTuple typeTup, int32 typmod, Oid collation)
 	}
 	typ->typlen = typeStruct->typlen;
 	typ->typbyval = typeStruct->typbyval;
+	typ->typtype = typeStruct->typtype;
 	typ->typrelid = typeStruct->typrelid;
-	typ->typioparam = getTypeIOParam(typeTup);
 	typ->collation = typeStruct->typcollation;
 	if (OidIsValid(collation) && OidIsValid(typ->collation))
 		typ->collation = collation;
-	fmgr_info(typeStruct->typinput, &(typ->typinput));
+	/* Detect if type is true array, or domain thereof */
+	/* NB: this is only used to decide whether to apply expand_array */
+	if (typeStruct->typtype == TYPTYPE_BASE)
+	{
+		/* this test should match what get_element_type() checks */
+		typ->typisarray = (typeStruct->typlen == -1 &&
+						   OidIsValid(typeStruct->typelem));
+	}
+	else if (typeStruct->typtype == TYPTYPE_DOMAIN)
+	{
+		/* we can short-circuit looking up base types if it's not varlena */
+		typ->typisarray = (typeStruct->typlen == -1 &&
+				 OidIsValid(get_base_element_type(typeStruct->typbasetype)));
+	}
+	else
+		typ->typisarray = false;
 	typ->atttypmod = typmod;
 
 	return typ;
@@ -2302,6 +2300,22 @@ plpgsql_parse_err_condition(char *condname)
 }
 
 /* ----------
+ * plpgsql_start_datums			Initialize datum list at compile startup.
+ * ----------
+ */
+static void
+plpgsql_start_datums(void)
+{
+	datums_alloc = 128;
+	plpgsql_nDatums = 0;
+	/* This is short-lived, so needn't allocate in function's cxt */
+	plpgsql_Datums = MemoryContextAlloc(compile_tmp_cxt,
+									 sizeof(PLpgSQL_datum *) * datums_alloc);
+	/* datums_last tracks what's been seen by plpgsql_add_initdatums() */
+	datums_last = 0;
+}
+
+/* ----------
  * plpgsql_adddatum			Add a variable, record or row
  *					to the compiler's datum list.
  * ----------
@@ -2317,6 +2331,39 @@ plpgsql_adddatum(PLpgSQL_datum *new)
 
 	new->dno = plpgsql_nDatums;
 	plpgsql_Datums[plpgsql_nDatums++] = new;
+}
+
+/* ----------
+ * plpgsql_finish_datums	Copy completed datum info into function struct.
+ *
+ * This is also responsible for building resettable_datums, a bitmapset
+ * of the dnos of all ROW, REC, and RECFIELD datums in the function.
+ * ----------
+ */
+static void
+plpgsql_finish_datums(PLpgSQL_function *function)
+{
+	Bitmapset  *resettable_datums = NULL;
+	int			i;
+
+	function->ndatums = plpgsql_nDatums;
+	function->datums = palloc(sizeof(PLpgSQL_datum *) * plpgsql_nDatums);
+	for (i = 0; i < plpgsql_nDatums; i++)
+	{
+		function->datums[i] = plpgsql_Datums[i];
+		switch (function->datums[i]->dtype)
+		{
+			case PLPGSQL_DTYPE_ROW:
+			case PLPGSQL_DTYPE_REC:
+			case PLPGSQL_DTYPE_RECFIELD:
+				resettable_datums = bms_add_member(resettable_datums, i);
+				break;
+
+			default:
+				break;
+		}
+	}
+	function->resettable_datums = resettable_datums;
 }
 
 
@@ -2519,11 +2566,10 @@ plpgsql_HashTableInit(void)
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(PLpgSQL_func_hashkey);
 	ctl.entrysize = sizeof(plpgsql_HashEnt);
-	ctl.hash = tag_hash;
 	plpgsql_HashTable = hash_create("PLpgSQL function cache",
 									FUNCS_PER_USER,
 									&ctl,
-									HASH_ELEM | HASH_FUNCTION);
+									HASH_ELEM | HASH_BLOBS);
 }
 
 static PLpgSQL_function *

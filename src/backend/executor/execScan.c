@@ -7,7 +7,7 @@
  *	  stuff - checking the qualification and projecting the tuple
  *	  appropriately.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -88,7 +88,7 @@ ExecScanFetch(ScanState *node,
  *		Scans the relation using the 'access method' indicated and
  *		returns the next qualifying tuple in the direction specified
  *		in the global variable ExecDirection.
- *		The access method returns the next tuple and execScan() is
+ *		The access method returns the next tuple and ExecScan() is
  *		responsible for checking the tuple returned against the qual-clause.
  *
  *		A 'recheck method' must also be provided that can check an
@@ -246,13 +246,18 @@ void
 ExecAssignScanProjectionInfo(ScanState *node)
 {
 	Scan	   *scan = (Scan *) node->ps.plan;
-	Index		varno;
 
-	/* Vars in an index-only scan's tlist should be INDEX_VAR */
-	if (IsA(scan, IndexOnlyScan))
-		varno = INDEX_VAR;
-	else
-		varno = scan->scanrelid;
+	ExecAssignScanProjectionInfoWithVarno(node, scan->scanrelid);
+}
+
+/*
+ * ExecAssignScanProjectionInfoWithVarno
+ *		As above, but caller can specify varno expected in Vars in the tlist.
+ */
+void
+ExecAssignScanProjectionInfoWithVarno(ScanState *node, Index varno)
+{
+	Scan	   *scan = (Scan *) node->ps.plan;
 
 	if (tlist_matches_tupdesc(&node->ps,
 							  scan->plan.targetlist,
