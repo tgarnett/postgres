@@ -88,12 +88,14 @@ static void restore_toc_entries_prefork(ArchiveHandle *AH);
 static void restore_toc_entries_parallel(ArchiveHandle *AH, ParallelState *pstate,
 							 TocEntry *pending_list);
 static void restore_toc_entries_postfork(ArchiveHandle *AH, TocEntry *pending_list);
+static void parallel_restore_close_db_connection(ArchiveHandle *AH);
+static void parallel_restore_reestablish_db_connection(ArchiveHandle *AH);
 static void par_list_header_init(TocEntry *l);
 static void par_list_append(TocEntry *l, TocEntry *te);
 static void par_list_remove(TocEntry *te);
 static TocEntry *get_next_work_item(ArchiveHandle *AH,
 				   TocEntry *ready_list,
-				   ParallelState *pstate);
+				   ParallelState *pstate, bool pref_non_data);
 static void mark_work_done(ArchiveHandle *AH, TocEntry *ready_list,
 			   int worker, int status,
 			   ParallelState *pstate);
@@ -103,6 +105,7 @@ static void repoint_table_dependencies(ArchiveHandle *AH);
 static void identify_locking_dependencies(ArchiveHandle *AH, TocEntry *te);
 static void reduce_dependencies(ArchiveHandle *AH, TocEntry *te,
 					TocEntry *ready_list);
+static void add_dependency(TocEntry *te, DumpId refId);
 static void mark_create_done(ArchiveHandle *AH, TocEntry *te);
 static void inhibit_data_for_failed_table(ArchiveHandle *AH, TocEntry *te);
 
@@ -124,7 +127,8 @@ setupRestoreWorker(Archive *AHX, RestoreOptions *ropt)
 {
 	ArchiveHandle *AH = (ArchiveHandle *) AHX;
 
-	(AH->ReopenPtr) (AH);
+	if (AH->ReopenPtr)
+		(AH->ReopenPtr) (AH);
 }
 
 
@@ -253,18 +257,12 @@ RestoreArchive(Archive *AHX)
 	if (parallel_mode)
 	{
 		/* We haven't got round to making this work for all archive formats */
-		if (AH->ClonePtr == NULL || AH->ReopenPtr == NULL)
+		if (AH->ClonePtr == NULL)
 			exit_horribly(modulename, "parallel restore is not supported with this archive file format\n");
 
 		/* Doesn't work if the archive represents dependencies as OIDs */
 		if (AH->version < K_VERS_1_8)
 			exit_horribly(modulename, "parallel restore is not supported with archives made by pre-8.0 pg_dump\n");
-
-		/*
-		 * It's also not gonna work if we can't reopen the input file, so
-		 * let's try that immediately.
-		 */
-		(AH->ReopenPtr) (AH);
 	}
 
 	/*
@@ -3476,16 +3474,60 @@ dumpTimestamp(ArchiveHandle *AH, const char *msg, time_t tim)
 		ahprintf(AH, "-- %s %s\n\n", msg, buf);
 }
 
+void
+parallel_restore_close_db_connection(ArchiveHandle *AH)
+{
+	DisconnectDatabase(&AH->public);
+
+	/* blow away any transient state from the old connection */
+	if (AH->currUser)
+		free(AH->currUser);
+	AH->currUser = NULL;
+	if (AH->currSchema)
+		free(AH->currSchema);
+	AH->currSchema = NULL;
+	if (AH->currTablespace)
+		free(AH->currTablespace);
+	AH->currTablespace = NULL;
+	AH->currWithOids = -1;
+}
+
+void
+parallel_restore_reestablish_db_connection(ArchiveHandle *AH)
+{
+	RestoreOptions *ropt = AH->ropt;
+
+	ConnectDatabase((Archive *) AH, ropt->dbname,
+					ropt->pghost, ropt->pgport, ropt->username,
+					ropt->promptPassword);
+
+	_doSetFixedOutputState(AH);
+}
+
 /*
  * Main engine for parallel restore.
  *
  * Work is done in three phases.
- * First we process all SECTION_PRE_DATA tocEntries, in a single connection,
- * just as for a standard restore.  Second we process the remaining non-ACL
- * steps in parallel worker children (threads on Windows, processes on Unix),
- * each of which connects separately to the database.  Finally we process all
- * the ACL entries in a single connection (that happens back in
- * RestoreArchive).
+ * 1) First we process all SECTION_PRE_DATA tocEntries, in a single connection,
+ *    just as for a standard restore.
+ * 2) Second we process the remaining non-ACL steps in parallel worker children
+ *    (threads on Windows, processes on Unix), each of which connects separately
+ *    to the database. In the case where we are unable to reopen the archive
+ *    (STDIN) we add a dependency between each SECTION_DATA item and the next
+ *    so they are processed one at a time and in order obviating the need to
+ *    reopen the archive. This is handled by fix_dependencies.
+ * 3) Finally we process all the ACL entries in a single connection
+ *    (that happens back in RestoreArchive).
+ *
+ * NOTE - in the case where we are unable to reopen the archive, we load data
+ * in the parent thread which blocks dispatching other work entries.  We do this
+ * to avoid issues with the archive file state and the need to communicate that
+ * up to the parent thread from any data loading child. To keep the parallelism
+ * up we favor non-data loading tasks over data loading tasks, but this does
+ * limit parallelism slightly over the optimal case where one thread would
+ * continually load data.  However tracking that would seem to involve a lot
+ * of extra complexity around inter-process communication and this gets us
+ * pretty close.
  */
 static void
 restore_toc_entries_prefork(ArchiveHandle *AH)
@@ -3553,19 +3595,8 @@ restore_toc_entries_prefork(ArchiveHandle *AH)
 	 * mainly to ensure that we don't exceed the specified number of parallel
 	 * connections.
 	 */
-	DisconnectDatabase(&AH->public);
+	parallel_restore_close_db_connection(AH);
 
-	/* blow away any transient state from the old connection */
-	if (AH->currUser)
-		free(AH->currUser);
-	AH->currUser = NULL;
-	if (AH->currSchema)
-		free(AH->currSchema);
-	AH->currSchema = NULL;
-	if (AH->currTablespace)
-		free(AH->currTablespace);
-	AH->currTablespace = NULL;
-	AH->currWithOids = -1;
 }
 
 /*
@@ -3588,6 +3619,7 @@ restore_toc_entries_parallel(ArchiveHandle *AH, ParallelState *pstate,
 	bool		skipped_some;
 	TocEntry	ready_list;
 	TocEntry   *next_work_item;
+	RestoreOptions *ropt = AH->ropt;
 	int			ret_child;
 
 	ahlog(AH, 2, "entering restore_toc_entries_parallel\n");
@@ -3640,7 +3672,9 @@ restore_toc_entries_parallel(ArchiveHandle *AH, ParallelState *pstate,
 
 	ahlog(AH, 1, "entering main parallel loop\n");
 
-	while ((next_work_item = get_next_work_item(AH, &ready_list, pstate)) != NULL ||
+	/* Since we'll block while loading data when we can't reopen the file,
+	 * we prefer non-data work items in the selection here for parallelism */
+	while ((next_work_item = get_next_work_item(AH, &ready_list, pstate, AH->ReopenPtr == NULL)) != NULL ||
 		   !IsEveryWorkerIdle(pstate))
 	{
 		if (next_work_item != NULL)
@@ -3666,7 +3700,30 @@ restore_toc_entries_parallel(ArchiveHandle *AH, ParallelState *pstate,
 			par_list_remove(next_work_item);
 
 			Assert(GetIdleWorker(pstate) != NO_SLOT);
-			DispatchJobForTocEntry(AH, pstate, next_work_item, ACT_RESTORE);
+
+			/* to avoid the need for inter-process communication around file
+			 * positioning etc. we do all data loading in the main loop */
+			if (AH->ReopenPtr == NULL && next_work_item->section == SECTION_DATA)
+			{
+				/* Load data, this will block dispatching work items till finished */
+				/* re-establish db connection, we know there's at least one
+				 * connection slot unused so not exceeding requested max in terms
+				 * of active workers, however we are using one more connection then
+				 * requested since the workers eagerly create their connections
+				 * and hold them open (as of 9.3 parallel.c refactor). FIXME -
+				 * would be nice to respect -j both in terms of connections and
+				 * and active workers (but +1 connection when from stdin isn't
+				 * too out of line to cover by documenting).
+				 */
+				parallel_restore_reestablish_db_connection(AH);
+				(void) restore_toc_entry(AH, next_work_item, ropt, false);
+				reduce_dependencies(AH, next_work_item, &ready_list);
+				/* Release db connection so can be used in parallel children */
+				parallel_restore_close_db_connection(AH);
+				continue;
+			}
+			else
+				DispatchJobForTocEntry(AH, pstate, next_work_item, ACT_RESTORE);
 		}
 		else
 		{
@@ -3731,11 +3788,7 @@ restore_toc_entries_postfork(ArchiveHandle *AH, TocEntry *pending_list)
 	/*
 	 * Now reconnect the single parent connection.
 	 */
-	ConnectDatabase((Archive *) AH, ropt->dbname,
-					ropt->pghost, ropt->pgport, ropt->username,
-					ropt->promptPassword);
-
-	_doSetFixedOutputState(AH);
+	parallel_restore_reestablish_db_connection(AH);
 
 	/*
 	 * Make sure there is no non-ACL work left due to, say, circular
@@ -3820,33 +3873,15 @@ par_list_remove(TocEntry *te)
  * The caller must do that after successfully dispatching the item.
  *
  * pref_non_data is for an alternative selection algorithm that gives
- * preference to non-data items if there is already a data load running.
- * It is currently disabled.
+ * preference to non-data items
  */
 static TocEntry *
 get_next_work_item(ArchiveHandle *AH, TocEntry *ready_list,
-				   ParallelState *pstate)
+				   ParallelState *pstate, bool pref_non_data)
 {
-	bool		pref_non_data = false;	/* or get from AH->ropt */
 	TocEntry   *data_te = NULL;
 	TocEntry   *te;
-	int			i,
-				k;
-
-	/*
-	 * Bogus heuristics for pref_non_data
-	 */
-	if (pref_non_data)
-	{
-		int			count = 0;
-
-		for (k = 0; k < pstate->numWorkers; k++)
-			if (pstate->parallelSlot[k].args->te != NULL &&
-				pstate->parallelSlot[k].args->te->section == SECTION_DATA)
-				count++;
-		if (pstate->numWorkers == 0 || count * 4 < pstate->numWorkers)
-			pref_non_data = false;
-	}
+	int			i;
 
 	/*
 	 * Search the ready_list until we find a suitable item.
@@ -3868,8 +3903,12 @@ get_next_work_item(ArchiveHandle *AH, TocEntry *ready_list,
 				continue;
 			running_te = pstate->parallelSlot[i].args->te;
 
+			/* When running parallel without ReopenPtr dependencies are added
+			 * to force data sections to dump serially and in order. These
+			 * dependencies don't care about locking however, so ignore them
+			 * here in the locking conflict check. */
 			if (has_lock_conflicts(te, running_te) ||
-				has_lock_conflicts(running_te, te))
+				((AH->ReopenPtr || te->section != SECTION_DATA) && has_lock_conflicts(running_te, te)))
 			{
 				conflicts = true;
 				break;
@@ -3968,6 +4007,10 @@ mark_work_done(ArchiveHandle *AH, TocEntry *ready_list,
 /*
  * Process the dependency information into a form useful for parallel restore.
  *
+ * In the case where we can't reopen the archive file (STDIN) we add
+ * dependencies to ensure the data sections are dumped serially and in order
+ * to match file pointer progression.
+ *
  * This function takes care of fixing up some missing or badly designed
  * dependencies, and then prepares subsidiary data structures that will be
  * used in the main parallel-restore logic, including:
@@ -3982,6 +4025,7 @@ static void
 fix_dependencies(ArchiveHandle *AH)
 {
 	TocEntry   *te;
+	TocEntry   *last_data_te = NULL;
 	int			i;
 
 	/*
@@ -4021,10 +4065,7 @@ fix_dependencies(ArchiveHandle *AH)
 				{
 					if (strcmp(te2->desc, "BLOBS") == 0)
 					{
-						te->dependencies = (DumpId *) pg_malloc(sizeof(DumpId));
-						te->dependencies[0] = te2->dumpId;
-						te->nDeps++;
-						te->depCount++;
+						add_dependency(te, te2->dumpId);
 						break;
 					}
 				}
@@ -4032,6 +4073,25 @@ fix_dependencies(ArchiveHandle *AH)
 			}
 		}
 	}
+
+	/*
+	 * Add dependencies to ensure SECTION_DATA items are dumped serially and in
+	 * order in the case where we are unable to reopen the archive file (STDIN)
+	 */
+	if (AH->ReopenPtr == NULL)
+	{
+		for (te = AH->toc->next; te != AH->toc; te = te->next)
+		{
+			if (te->section == SECTION_DATA)
+			{
+				if (last_data_te)
+					add_dependency(te, last_data_te->dumpId);
+
+				last_data_te = te;
+			}
+		}
+	}
+
 
 	/*
 	 * At this point we start to build the revDeps reverse-dependency arrays,
@@ -4208,6 +4268,25 @@ reduce_dependencies(ArchiveHandle *AH, TocEntry *te, TocEntry *ready_list)
 			par_list_append(ready_list, otherte);
 		}
 	}
+}
+
+/*
+ * Adds a dependency to a TocEntry.  We use this to add dependencies that are
+ * known to be missing in the archive and setup constraints on the order in
+ * which table data is restored during parallel restore when we are unable to
+ * reopen the archive file.
+ */
+static void
+add_dependency(TocEntry *te, DumpId refId)
+{
+	if (te->dependencies == NULL)
+		te->dependencies = (DumpId *) pg_malloc(sizeof(DumpId));
+	else
+		te->dependencies = (DumpId *) pg_realloc(te->dependencies, sizeof(DumpId) * (te->nDeps + 1));
+
+	te->dependencies[te->nDeps] = refId;
+	te->nDeps++;
+	te->depCount++;
 }
 
 /*
